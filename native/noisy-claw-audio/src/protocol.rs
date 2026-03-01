@@ -1,4 +1,28 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct SttConfig {
+    pub provider: String,
+    pub api_key: Option<String>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub languages: Option<Vec<String>>,
+    pub extra: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TtsConfig {
+    pub provider: String,
+    pub api_key: Option<String>,
+    pub endpoint: Option<String>,
+    pub model: Option<String>,
+    pub voice: Option<String>,
+    pub format: Option<String>,
+    pub sample_rate: Option<u32>,
+    pub speed: Option<f64>,
+    pub extra: Option<HashMap<String, String>>,
+}
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -8,8 +32,14 @@ pub enum Command {
         device: String,
         #[serde(default = "default_sample_rate")]
         sample_rate: u32,
+        stt: Option<SttConfig>,
     },
     StopCapture,
+    Speak {
+        text: String,
+        tts: TtsConfig,
+    },
+    StopSpeaking,
     PlayAudio {
         path: String,
     },
@@ -41,10 +71,13 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
     },
+    SpeakStarted,
+    SpeakDone,
     PlaybackDone,
     Status {
         capturing: bool,
         playing: bool,
+        speaking: bool,
     },
     Error {
         message: String,
@@ -62,9 +95,10 @@ mod tests {
         let json = r#"{"cmd":"start_capture"}"#;
         let cmd: Command = serde_json::from_str(json).unwrap();
         match cmd {
-            Command::StartCapture { device, sample_rate } => {
+            Command::StartCapture { device, sample_rate, stt } => {
                 assert_eq!(device, "default");
                 assert_eq!(sample_rate, 16000);
+                assert!(stt.is_none());
             }
             _ => panic!("expected StartCapture"),
         }
@@ -75,12 +109,51 @@ mod tests {
         let json = r#"{"cmd":"start_capture","device":"MacBook Pro Microphone","sample_rate":44100}"#;
         let cmd: Command = serde_json::from_str(json).unwrap();
         match cmd {
-            Command::StartCapture { device, sample_rate } => {
+            Command::StartCapture { device, sample_rate, stt } => {
                 assert_eq!(device, "MacBook Pro Microphone");
                 assert_eq!(sample_rate, 44100);
+                assert!(stt.is_none());
             }
             _ => panic!("expected StartCapture"),
         }
+    }
+
+    #[test]
+    fn deserialize_start_capture_with_cloud_stt() {
+        let json = r#"{"cmd":"start_capture","stt":{"provider":"aliyun","api_key":"sk-xxx","model":"paraformer-realtime-v2","languages":["zh","en"]}}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::StartCapture { stt, .. } => {
+                let stt = stt.unwrap();
+                assert_eq!(stt.provider, "aliyun");
+                assert_eq!(stt.api_key.unwrap(), "sk-xxx");
+                assert_eq!(stt.model.unwrap(), "paraformer-realtime-v2");
+                assert_eq!(stt.languages.unwrap(), vec!["zh", "en"]);
+            }
+            _ => panic!("expected StartCapture"),
+        }
+    }
+
+    #[test]
+    fn deserialize_speak() {
+        let json = r#"{"cmd":"speak","text":"hello","tts":{"provider":"aliyun","model":"cosyvoice-v3-flash","voice":"longanyang"}}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::Speak { text, tts } => {
+                assert_eq!(text, "hello");
+                assert_eq!(tts.provider, "aliyun");
+                assert_eq!(tts.model.unwrap(), "cosyvoice-v3-flash");
+                assert_eq!(tts.voice.unwrap(), "longanyang");
+            }
+            _ => panic!("expected Speak"),
+        }
+    }
+
+    #[test]
+    fn deserialize_stop_speaking() {
+        let json = r#"{"cmd":"stop_speaking"}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        assert!(matches!(cmd, Command::StopSpeaking));
     }
 
     #[test]
@@ -183,13 +256,28 @@ mod tests {
     }
 
     #[test]
+    fn serialize_speak_started() {
+        let json = serde_json::to_string(&Event::SpeakStarted).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "speak_started");
+    }
+
+    #[test]
+    fn serialize_speak_done() {
+        let json = serde_json::to_string(&Event::SpeakDone).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "speak_done");
+    }
+
+    #[test]
     fn serialize_status() {
-        let event = Event::Status { capturing: true, playing: false };
+        let event = Event::Status { capturing: true, playing: false, speaking: false };
         let json = serde_json::to_string(&event).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["event"], "status");
         assert_eq!(v["capturing"], true);
         assert_eq!(v["playing"], false);
+        assert_eq!(v["speaking"], false);
     }
 
     #[test]
@@ -207,7 +295,10 @@ mod tests {
     fn round_trip_all_commands() {
         let commands = vec![
             r#"{"cmd":"start_capture"}"#,
+            r#"{"cmd":"start_capture","stt":{"provider":"whisper"}}"#,
             r#"{"cmd":"stop_capture"}"#,
+            r#"{"cmd":"speak","text":"hi","tts":{"provider":"aliyun"}}"#,
+            r#"{"cmd":"stop_speaking"}"#,
             r#"{"cmd":"play_audio","path":"/tmp/test.mp3"}"#,
             r#"{"cmd":"stop_playback"}"#,
             r#"{"cmd":"get_status"}"#,
@@ -232,8 +323,10 @@ mod tests {
                 end: 1.0,
                 confidence: None,
             },
+            Event::SpeakStarted,
+            Event::SpeakDone,
             Event::PlaybackDone,
-            Event::Status { capturing: false, playing: true },
+            Event::Status { capturing: false, playing: true, speaking: false },
             Event::Error { message: "fail".to_string() },
         ];
         for event in events {

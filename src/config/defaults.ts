@@ -9,9 +9,9 @@ export const DEFAULT_VOICE_CONFIG: Required<VoiceConfig> = {
     device: "default",
   },
   stt: {
-    backend: "whisper",
+    provider: "whisper",
     model: "base",
-    language: "en",
+    languages: ["en"],
   },
   tts: {
     enabled: true,

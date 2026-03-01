@@ -1,6 +1,13 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface, type Interface } from "node:readline";
-import { type Command, type AudioEvent, parseEvent, serializeCommand } from "./protocol.js";
+import {
+  type Command,
+  type AudioEvent,
+  type SttConfig,
+  type TtsConfig,
+  parseEvent,
+  serializeCommand,
+} from "./protocol.js";
 
 export type SubprocessOptions = {
   binaryPath: string;
@@ -89,6 +96,16 @@ export class AudioSubprocess {
     } catch {
       return false;
     }
+  }
+
+  /** Send a speak command with TTS config. */
+  speak(text: string, ttsConfig: TtsConfig): void {
+    this.send({ cmd: "speak", text, tts: ttsConfig });
+  }
+
+  /** Stop current TTS speech playback. */
+  stopSpeaking(): void {
+    this.trySend({ cmd: "stop_speaking" });
   }
 
   stop(): void {

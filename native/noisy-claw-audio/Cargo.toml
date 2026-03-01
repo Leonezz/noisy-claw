@@ -23,6 +23,13 @@ serde_json = "1"
 # Async runtime (needed now for clean concurrency, and later for cloud STT/TTS providers)
 tokio = { version = "1", features = ["full"] }
 
+# Cloud STT/TTS (WebSocket)
+tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+futures-util = "0.3"
+async-trait = "0.1"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+
 # Utilities
 anyhow = "1"
 base64 = "0.22"

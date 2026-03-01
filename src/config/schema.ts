@@ -12,14 +12,26 @@ export const VoiceConfigSchema = z.object({
     .optional(),
   stt: z
     .object({
-      backend: z.enum(["whisper"]).optional(),
+      provider: z.string().optional(),
       model: z.string().optional(),
-      language: z.string().optional(),
+      languages: z.array(z.string()).optional(),
+      apiKey: z.string().optional(),
+      endpoint: z.string().optional(),
+      extra: z.record(z.string(), z.string()).optional(),
     })
     .optional(),
   tts: z
     .object({
       enabled: z.boolean().optional(),
+      provider: z.string().optional(),
+      model: z.string().optional(),
+      voice: z.string().optional(),
+      apiKey: z.string().optional(),
+      endpoint: z.string().optional(),
+      format: z.string().optional(),
+      sampleRate: z.number().optional(),
+      speed: z.number().optional(),
+      extra: z.record(z.string(), z.string()).optional(),
     })
     .optional(),
   conversation: z

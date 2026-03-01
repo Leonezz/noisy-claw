@@ -11,22 +11,38 @@ export function registerVoiceCli(program: Command, stateDir: string): void {
     .command("setup")
     .description("Download required models for voice processing")
     .option("--stt-model <id>", "STT model to download", DEFAULT_STT_MODEL_ID)
-    .action(async (opts: { sttModel: string }) => {
+    .option("--stt-provider <name>", "STT provider (whisper, aliyun, ...)", "whisper")
+    .option("--tts-provider <name>", "TTS provider (aliyun, ...)")
+    .action(async (opts: { sttModel: string; sttProvider: string; ttsProvider?: string }) => {
       const modelsDir = join(stateDir, "models");
-      const sttModels = getSTTModels();
 
       console.log("\n  Noisy Claw — Voice Setup\n");
-      console.log("  Available STT models:");
-      for (const m of sttModels) {
-        const marker = m.id === opts.sttModel ? " *" : "  ";
-        const size = `${Math.round(m.sizeBytes / 1_000_000)}MB`;
-        console.log(`  ${marker} ${m.id.padEnd(16)} ${size.padStart(6)}  ${m.description}`);
+
+      if (opts.sttProvider === "whisper") {
+        const sttModels = getSTTModels();
+        console.log("  STT provider: whisper (local)");
+        console.log("  Available STT models:");
+        for (const m of sttModels) {
+          const marker = m.id === opts.sttModel ? " *" : "  ";
+          const size = `${Math.round(m.sizeBytes / 1_000_000)}MB`;
+          console.log(`  ${marker} ${m.id.padEnd(16)} ${size.padStart(6)}  ${m.description}`);
+        }
+        console.log(`\n  Selected: ${opts.sttModel}\n`);
+      } else {
+        console.log(`  STT provider: ${opts.sttProvider} (cloud)`);
+        console.log("  Whisper model download skipped — using cloud STT.");
+        console.log("  Ensure your API key is set (e.g. DASHSCOPE_API_KEY env var or in config).\n");
       }
-      console.log(`\n  Selected: ${opts.sttModel}\n`);
+
+      if (opts.ttsProvider) {
+        console.log(`  TTS provider: ${opts.ttsProvider} (cloud)`);
+        console.log("  Ensure your API key is set for TTS.\n");
+      }
 
       const result = await ensureModels({
         modelsDir,
         sttModelId: opts.sttModel,
+        sttProvider: opts.sttProvider,
         onProgress: (p) => {
           process.stdout.write(`\r  Downloading ${p.model.filename}... ${p.percent}%`);
         },

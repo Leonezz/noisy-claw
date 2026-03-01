@@ -1,3 +1,4 @@
+import type { SttConfig } from "../ipc/protocol.js";
 import type {
   AudioSource,
   STTProvider,
@@ -12,6 +13,7 @@ import type {
 export type PipelineConfig = {
   audio: AudioConfig;
   stt: STTConfig;
+  sttConfig?: SttConfig;
 };
 
 export type PipelineComponents = {
@@ -75,6 +77,11 @@ export class PipelineCoordinator {
   start(config: PipelineConfig): void {
     if (this.active) return;
     this.active = true;
+    // Pass cloud STT config to audio source if available
+    const source = this.components.audioSource as { setSttConfig?: (c: unknown) => void };
+    if (typeof source.setSttConfig === "function") {
+      source.setSttConfig(config.sttConfig);
+    }
     this.components.audioSource.start(config.audio);
     this.components.sttProvider.start(config.stt);
   }

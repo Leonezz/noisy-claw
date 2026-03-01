@@ -40,7 +40,7 @@ export class RustLocalPlayback implements AudioOutput {
 
   /** Called by the coordinator when IPC events arrive. */
   handleEvent(event: AudioEvent): void {
-    if (event.event === "playback_done") {
+    if (event.event === "playback_done" || event.event === "speak_done") {
       this.playing = false;
       if (this.playResolve) {
         this.playResolve();

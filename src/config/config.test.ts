@@ -33,11 +33,11 @@ describe("VoiceConfigSchema", () => {
     expect(result.success).toBe(false);
   });
 
-  it("rejects invalid stt backend", () => {
+  it("accepts any stt provider string", () => {
     const result = VoiceConfigSchema.safeParse({
-      stt: { backend: "deepgram" },
+      stt: { provider: "aliyun", model: "paraformer-realtime-v2" },
     });
-    expect(result.success).toBe(false);
+    expect(result.success).toBe(true);
   });
 });
 
@@ -47,8 +47,8 @@ describe("DEFAULT_VOICE_CONFIG", () => {
     expect(DEFAULT_VOICE_CONFIG.mode).toBe("conversation");
     expect(DEFAULT_VOICE_CONFIG.audio.sampleRate).toBe(16000);
     expect(DEFAULT_VOICE_CONFIG.audio.device).toBe("default");
-    expect(DEFAULT_VOICE_CONFIG.stt.backend).toBe("whisper");
-    expect(DEFAULT_VOICE_CONFIG.stt.language).toBe("en");
+    expect(DEFAULT_VOICE_CONFIG.stt.provider).toBe("whisper");
+    expect(DEFAULT_VOICE_CONFIG.stt.languages).toEqual(["en"]);
     expect(DEFAULT_VOICE_CONFIG.tts.enabled).toBe(true);
     expect(DEFAULT_VOICE_CONFIG.conversation.endOfTurnSilence).toBe(700);
     expect(DEFAULT_VOICE_CONFIG.conversation.interruptible).toBe(true);

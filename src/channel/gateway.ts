@@ -4,7 +4,7 @@ import type {
   ChannelGatewayContext,
   PluginRuntime,
 } from "openclaw/plugin-sdk";
-import type { AudioEvent } from "../ipc/protocol.js";
+import type { AudioEvent, SttConfig, TtsConfig } from "../ipc/protocol.js";
 import { AudioSubprocess } from "../ipc/subprocess.js";
 import { resolveModelsDir as resolveFromManager } from "../models/manager.js";
 import { PipelineCoordinator, type PipelineComponents } from "../pipeline/coordinator.js";
@@ -57,6 +57,18 @@ export function setStateDir(dir: string): void {
   injectedStateDir = dir;
 }
 
+/**
+ * Resolve the API key for a cloud provider config.
+ * Priority: explicit config value > environment variable.
+ */
+function resolveApiKey(
+  configKey: string | undefined,
+  envVar: string,
+): string | undefined {
+  if (configKey) return configKey;
+  return process.env[envVar];
+}
+
 export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<ResolvedVoiceAccount>) => {
     const { account, abortSignal } = ctx;
@@ -68,6 +80,36 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     // Create session
     const session = new VoiceSession();
     activeSession = session;
+
+    // Resolve STT config for IPC
+    const sttProvider = config.stt?.provider ?? "whisper";
+    const sttConfig: SttConfig | undefined =
+      sttProvider !== "whisper"
+        ? {
+            provider: sttProvider,
+            api_key: resolveApiKey(config.stt?.apiKey, "DASHSCOPE_API_KEY"),
+            endpoint: config.stt?.endpoint,
+            model: config.stt?.model,
+            languages: config.stt?.languages ?? ["en"],
+            extra: config.stt?.extra as Record<string, string> | undefined,
+          }
+        : undefined;
+
+    // Resolve TTS config (used when speaking)
+    const ttsProvider = config.tts?.provider;
+    const ttsConfig: TtsConfig | undefined = ttsProvider
+      ? {
+          provider: ttsProvider,
+          api_key: resolveApiKey(config.tts?.apiKey, "DASHSCOPE_API_KEY"),
+          endpoint: config.tts?.endpoint,
+          model: config.tts?.model,
+          voice: config.tts?.voice,
+          format: config.tts?.format,
+          sample_rate: config.tts?.sampleRate,
+          speed: config.tts?.speed,
+          extra: config.tts?.extra as Record<string, string> | undefined,
+        }
+      : undefined;
 
     // Create pipeline components — these need the subprocess reference,
     // but the subprocess needs references to route events to them.
@@ -86,8 +128,14 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
         if (event.event === "transcript") {
           rustSTT?.handleEvent(event);
         }
-        if (event.event === "playback_done") {
+        if (event.event === "playback_done" || event.event === "speak_done") {
           rustPlayback?.handleEvent(event);
+        }
+        if (event.event === "speak_started") {
+          session.update(session.setSpeaking(true));
+        }
+        if (event.event === "speak_done") {
+          session.update(session.setSpeaking(false));
         }
         if (event.event === "error") {
           console.error(
@@ -114,22 +162,28 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       silenceThresholdMs: config.conversation.endOfTurnSilence,
     });
 
-    if (!injectedTtsProvider) {
-      console.warn("[noisy-claw] No TTS provider injected — voice responses will be text-only");
-    }
-
-    // Create a no-op TTS fallback if none injected
-    const ttsProvider: TTSProvider = injectedTtsProvider ?? {
-      synthesize: async () => {
-        throw new Error("No TTS provider configured");
-      },
-    };
+    // Create TTS provider that delegates to Rust subprocess when cloud TTS configured,
+    // otherwise falls back to injected provider (OpenClaw core TTS)
+    const ttsProviderImpl: TTSProvider = ttsConfig
+      ? {
+          synthesize: async (text: string) => {
+            // Cloud TTS: send speak command to Rust subprocess
+            // The Rust side handles synthesis + playback
+            subprocess.speak(text, ttsConfig);
+            return ""; // Path not needed — Rust handles playback internally
+          },
+        }
+      : injectedTtsProvider ?? {
+          synthesize: async () => {
+            throw new Error("No TTS provider configured");
+          },
+        };
 
     const components: PipelineComponents = {
       audioSource: rustCapture,
       sttProvider: rustSTT,
       segmentation,
-      ttsProvider,
+      ttsProvider: ttsProviderImpl,
       audioOutput: rustPlayback,
     };
 
@@ -153,7 +207,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       };
 
       console.log(
-        `[noisy-claw] dispatching transcript: "${message.slice(0, 80)}${message.length > 80 ? "…" : ""}"`,
+        `[noisy-claw] dispatching transcript: "${message.slice(0, 80)}${message.length > 80 ? "..." : ""}"`,
       );
       void dispatchVoiceTranscript(deps, message, metadata).catch((err) => {
         console.error("[noisy-claw] failed to dispatch transcript:", err);
@@ -170,9 +224,10 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
         sampleRate: config.audio.sampleRate ?? 16000,
       },
       stt: {
-        model: config.stt.model ?? "base",
-        language: config.stt.language ?? "en",
+        model: config.stt?.model ?? "base",
+        language: config.stt?.languages?.[0] ?? "en",
       },
+      sttConfig,
     });
 
     ctx.setStatus({

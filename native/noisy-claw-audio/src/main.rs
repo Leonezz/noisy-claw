@@ -1,10 +1,12 @@
 mod capture;
+mod cloud;
 mod playback;
 mod protocol;
 mod stt;
 mod vad;
 
 use anyhow::Result;
+use cloud::traits::{RecognizerConfig, SpeechRecognizer, SynthesizerConfig};
 use protocol::{Command, Event};
 use std::io::Write;
 use std::path::PathBuf;
@@ -47,10 +49,14 @@ async fn main() -> Result<()> {
     let mut capture_start_time: Option<Instant> = None;
     let mut suppress_stt = false;
     let mut was_speaking = false;
+    let mut is_speaking_tts = false;
+
+    // Cloud STT state
+    let mut cloud_recognizer: Option<Box<dyn SpeechRecognizer>> = None;
+    let mut using_cloud_stt = false;
 
     // Audio frame receiver — set when capture starts
     let mut audio_rx: Option<mpsc::UnboundedReceiver<capture::AudioFrame>> = None;
-
 
     // Playback completion receiver — set when playback starts
     let mut playback_done_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
@@ -76,10 +82,10 @@ async fn main() -> Result<()> {
 
                 match serde_json::from_str::<Command>(&line) {
                     Ok(cmd) => match cmd {
-                        Command::StartCapture { device, sample_rate } => {
+                        Command::StartCapture { device, sample_rate, stt } => {
                             let models_dir = resolve_models_dir();
 
-                            // Init VAD if needed
+                            // Init VAD (always needed — for echo suppression + interruption)
                             if vad_engine.is_none() {
                                 let vad_path = models_dir.join("silero_vad.onnx");
                                 match vad::VoiceActivityDetector::new(&vad_path, 0.5) {
@@ -93,16 +99,65 @@ async fn main() -> Result<()> {
                                 }
                             }
 
-                            // Init STT if needed (wrapped in Arc for spawn_blocking)
-                            if stt_engine.is_none() {
-                                let stt_filename = std::env::var("NOISY_CLAW_STT_MODEL")
-                                    .unwrap_or_else(|_| "ggml-base.bin".to_string());
-                                let model_path = models_dir.join(&stt_filename);
-                                match stt::WhisperSTT::new(&model_path, "en") {
-                                    Ok(s) => stt_engine = Some(Arc::new(s)),
+                            // Determine STT backend
+                            let stt_provider = stt.as_ref()
+                                .map(|c| c.provider.as_str())
+                                .unwrap_or("whisper");
+
+                            if stt_provider == "whisper" {
+                                // Local Whisper STT
+                                using_cloud_stt = false;
+                                if stt_engine.is_none() {
+                                    let stt_filename = std::env::var("NOISY_CLAW_STT_MODEL")
+                                        .unwrap_or_else(|_| "ggml-base.bin".to_string());
+                                    let model_path = models_dir.join(&stt_filename);
+                                    match stt::WhisperSTT::new(&model_path, "en") {
+                                        Ok(s) => stt_engine = Some(Arc::new(s)),
+                                        Err(e) => {
+                                            let _ = event_tx.send(Event::Error {
+                                                message: format!("STT init failed: {e}"),
+                                            }).await;
+                                            continue;
+                                        }
+                                    }
+                                }
+                            } else {
+                                // Cloud STT
+                                let stt_cfg = stt.as_ref().unwrap();
+                                let model = stt_cfg.model.as_deref().unwrap_or("paraformer-realtime-v2");
+                                let api_key = match &stt_cfg.api_key {
+                                    Some(k) => k.clone(),
+                                    None => {
+                                        let _ = event_tx.send(Event::Error {
+                                            message: "cloud STT requires api_key".to_string(),
+                                        }).await;
+                                        continue;
+                                    }
+                                };
+
+                                match cloud::create_recognizer(stt_provider, model) {
+                                    Ok(mut recognizer) => {
+                                        let recognizer_config = RecognizerConfig {
+                                            api_key,
+                                            endpoint: stt_cfg.endpoint.clone(),
+                                            model: model.to_string(),
+                                            languages: stt_cfg.languages.clone().unwrap_or_else(|| vec!["en".to_string()]),
+                                            sample_rate,
+                                            extra: stt_cfg.extra.clone().unwrap_or_default(),
+                                        };
+                                        if let Err(e) = recognizer.start(&recognizer_config).await {
+                                            let _ = event_tx.send(Event::Error {
+                                                message: format!("cloud STT start failed: {e}"),
+                                            }).await;
+                                            continue;
+                                        }
+                                        cloud_recognizer = Some(recognizer);
+                                        using_cloud_stt = true;
+                                        tracing::info!(provider = stt_provider, model, "cloud STT started");
+                                    }
                                     Err(e) => {
                                         let _ = event_tx.send(Event::Error {
-                                            message: format!("STT init failed: {e}"),
+                                            message: format!("cloud STT init failed: {e}"),
                                         }).await;
                                         continue;
                                     }
@@ -127,8 +182,18 @@ async fn main() -> Result<()> {
                         Command::StopCapture => {
                             capture.stop();
                             audio_rx = None;
-                            // Flush remaining speech buffer
-                            if !speech_buffer.is_empty() {
+
+                            // Stop cloud recognizer if active
+                            if let Some(ref mut recognizer) = cloud_recognizer {
+                                if let Err(e) = recognizer.stop().await {
+                                    tracing::error!(%e, "cloud STT stop failed");
+                                }
+                                cloud_recognizer = None;
+                                using_cloud_stt = false;
+                            }
+
+                            // Flush remaining speech buffer (local Whisper only)
+                            if !using_cloud_stt && !speech_buffer.is_empty() {
                                 if let Some(ref stt) = stt_engine {
                                     let samples = std::mem::take(&mut speech_buffer);
                                     let stt = stt.clone();
@@ -140,6 +205,113 @@ async fn main() -> Result<()> {
                                 }
                             }
                             tracing::info!("capture stopped");
+                        }
+
+                        Command::Speak { text, tts } => {
+                            suppress_stt = true;
+                            is_speaking_tts = true;
+                            let _ = event_tx.send(Event::SpeakStarted).await;
+
+                            let model = tts.model.as_deref().unwrap_or("cosyvoice-v3-flash");
+                            let provider = tts.provider.as_str();
+                            let api_key = match &tts.api_key {
+                                Some(k) => k.clone(),
+                                None => {
+                                    let _ = event_tx.send(Event::Error {
+                                        message: "TTS requires api_key".to_string(),
+                                    }).await;
+                                    let _ = event_tx.send(Event::SpeakDone).await;
+                                    suppress_stt = false;
+                                    is_speaking_tts = false;
+                                    continue;
+                                }
+                            };
+
+                            match cloud::create_synthesizer(provider, model) {
+                                Ok(synthesizer) => {
+                                    let synth_config = SynthesizerConfig {
+                                        api_key,
+                                        endpoint: tts.endpoint.clone(),
+                                        model: model.to_string(),
+                                        voice: tts.voice.clone().unwrap_or_else(|| "longanyang".to_string()),
+                                        format: tts.format.clone().unwrap_or_else(|| "wav".to_string()),
+                                        sample_rate: tts.sample_rate.unwrap_or(16000),
+                                        speed: tts.speed,
+                                        extra: tts.extra.clone().unwrap_or_default(),
+                                    };
+
+                                    match synthesizer.synthesize(&text, &synth_config).await {
+                                        Ok(audio_path) => {
+                                            tracing::info!(path = %audio_path.display(), "TTS synthesis complete");
+
+                                            // Init playback lazily
+                                            if playback.is_none() {
+                                                match playback::AudioPlayback::new() {
+                                                    Ok(p) => playback = Some(p),
+                                                    Err(e) => {
+                                                        suppress_stt = false;
+                                                        is_speaking_tts = false;
+                                                        let _ = event_tx.send(Event::Error {
+                                                            message: format!("playback init failed: {e}"),
+                                                        }).await;
+                                                        let _ = event_tx.send(Event::SpeakDone).await;
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+
+                                            let pb = playback.as_mut().unwrap();
+                                            match pb.play(&audio_path) {
+                                                Ok(player) => {
+                                                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+                                                    playback_done_rx = Some(done_rx);
+                                                    tokio::task::spawn_blocking(move || {
+                                                        player.sleep_until_end();
+                                                        let _ = done_tx.send(());
+                                                    });
+                                                }
+                                                Err(e) => {
+                                                    suppress_stt = false;
+                                                    is_speaking_tts = false;
+                                                    let _ = event_tx.send(Event::Error {
+                                                        message: format!("playback failed: {e}"),
+                                                    }).await;
+                                                    let _ = event_tx.send(Event::SpeakDone).await;
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            suppress_stt = false;
+                                            is_speaking_tts = false;
+                                            let _ = event_tx.send(Event::Error {
+                                                message: format!("TTS synthesis failed: {e}"),
+                                            }).await;
+                                            let _ = event_tx.send(Event::SpeakDone).await;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    suppress_stt = false;
+                                    is_speaking_tts = false;
+                                    let _ = event_tx.send(Event::Error {
+                                        message: format!("TTS init failed: {e}"),
+                                    }).await;
+                                    let _ = event_tx.send(Event::SpeakDone).await;
+                                }
+                            }
+                        }
+
+                        Command::StopSpeaking => {
+                            if let Some(ref mut pb) = playback {
+                                pb.stop();
+                            }
+                            if is_speaking_tts {
+                                let _ = event_tx.send(Event::SpeakDone).await;
+                            }
+                            suppress_stt = false;
+                            is_speaking_tts = false;
+                            playback_done_rx = None;
+                            tracing::info!("speaking stopped");
                         }
 
                         Command::PlayAudio { path } => {
@@ -191,6 +363,7 @@ async fn main() -> Result<()> {
                             let _ = event_tx.send(Event::Status {
                                 capturing: capture.is_running(),
                                 playing: playback.as_ref().map_or(false, |p| p.is_playing()),
+                                speaking: is_speaking_tts,
                             }).await;
                         }
 
@@ -198,6 +371,9 @@ async fn main() -> Result<()> {
                             capture.stop();
                             if let Some(ref mut pb) = playback {
                                 pb.stop();
+                            }
+                            if let Some(ref mut recognizer) = cloud_recognizer {
+                                let _ = recognizer.stop().await;
                             }
                             tracing::info!("shutting down");
                             break;
@@ -232,15 +408,20 @@ async fn main() -> Result<()> {
                                 }
 
                                 if !speaking && was_speaking && !suppress_stt {
-                                    // Speech ended — offload transcription to blocking task
-                                    if let Some(ref stt) = stt_engine {
-                                        let samples = std::mem::take(&mut speech_buffer);
-                                        let stt = stt.clone();
-                                        let tx = event_tx.clone();
-                                        let base = compute_base_time(speech_start_time.take(), capture_start_time);
-                                        tokio::task::spawn_blocking(move || {
-                                            transcribe_and_emit(&stt, &samples, base, &tx);
-                                        });
+                                    if using_cloud_stt {
+                                        // Cloud STT: results come asynchronously via poll_result
+                                        // No action needed on speech end — cloud handles segmentation
+                                    } else {
+                                        // Local Whisper: offload transcription to blocking task
+                                        if let Some(ref stt) = stt_engine {
+                                            let samples = std::mem::take(&mut speech_buffer);
+                                            let stt = stt.clone();
+                                            let tx = event_tx.clone();
+                                            let base = compute_base_time(speech_start_time.take(), capture_start_time);
+                                            tokio::task::spawn_blocking(move || {
+                                                transcribe_and_emit(&stt, &samples, base, &tx);
+                                            });
+                                        }
                                     }
                                 }
 
@@ -253,25 +434,71 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Accumulate audio for STT (only when not suppressed)
-                if !suppress_stt && was_speaking {
+                // Feed audio to cloud STT (if active and not suppressed)
+                if using_cloud_stt && !suppress_stt {
+                    if let Some(ref mut recognizer) = cloud_recognizer {
+                        if let Err(e) = recognizer.feed_audio(&frame).await {
+                            tracing::error!(%e, "cloud STT feed_audio failed");
+                        }
+                    }
+                }
+
+                // Accumulate audio for local Whisper STT (only when not suppressed)
+                if !using_cloud_stt && !suppress_stt && was_speaking {
                     speech_buffer.extend_from_slice(&frame);
                 }
             }
 
-            // Branch 3: Playback completion
+            // Branch 3: Poll cloud STT results
+            result = async {
+                if using_cloud_stt {
+                    if let Some(ref mut recognizer) = cloud_recognizer {
+                        return recognizer.poll_result().await;
+                    }
+                }
+                // No cloud STT — pend forever
+                std::future::pending::<Result<Option<cloud::traits::RecognitionResult>>>().await
+            } => {
+                match result {
+                    Ok(Some(recognition)) => {
+                        let _ = event_tx.send(Event::Transcript {
+                            text: recognition.text,
+                            is_final: recognition.is_final,
+                            start: recognition.start_time,
+                            end: recognition.end_time,
+                            confidence: recognition.confidence,
+                        }).await;
+                    }
+                    Ok(None) => {
+                        // No result yet — yield briefly to avoid busy-spinning
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(e) => {
+                        tracing::error!(%e, "cloud STT poll_result failed");
+                    }
+                }
+            }
+
+            // Branch 4: Playback completion
             Ok(()) = async {
                 match playback_done_rx.as_mut() {
                     Some(rx) => rx.await.map_err(|_| ()),
                     None => std::future::pending::<std::result::Result<(), ()>>().await,
                 }
             } => {
+                let was_tts = is_speaking_tts;
                 suppress_stt = false;
+                is_speaking_tts = false;
                 if let Some(ref pb) = playback {
                     pb.set_done();
                 }
                 playback_done_rx = None;
-                let _ = event_tx.send(Event::PlaybackDone).await;
+
+                if was_tts {
+                    let _ = event_tx.send(Event::SpeakDone).await;
+                } else {
+                    let _ = event_tx.send(Event::PlaybackDone).await;
+                }
             }
         }
     }

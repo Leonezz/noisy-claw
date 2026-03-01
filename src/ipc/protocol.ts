@@ -1,12 +1,46 @@
+// --- Config types for cloud providers ---
+
+export type SttConfig = {
+  provider: string;
+  api_key?: string;
+  endpoint?: string;
+  model?: string;
+  languages?: string[];
+  extra?: Record<string, string>;
+};
+
+export type TtsConfig = {
+  provider: string;
+  api_key?: string;
+  endpoint?: string;
+  model?: string;
+  voice?: string;
+  format?: string;
+  sample_rate?: number;
+  speed?: number;
+  extra?: Record<string, string>;
+};
+
 // Commands sent from Node.js to Rust (via stdin)
 export type StartCaptureCommand = {
   cmd: "start_capture";
   device?: string;
   sample_rate?: number;
+  stt?: SttConfig;
 };
 
 export type StopCaptureCommand = {
   cmd: "stop_capture";
+};
+
+export type SpeakCommand = {
+  cmd: "speak";
+  text: string;
+  tts: TtsConfig;
+};
+
+export type StopSpeakingCommand = {
+  cmd: "stop_speaking";
 };
 
 export type PlayAudioCommand = {
@@ -29,6 +63,8 @@ export type ShutdownCommand = {
 export type Command =
   | StartCaptureCommand
   | StopCaptureCommand
+  | SpeakCommand
+  | StopSpeakingCommand
   | PlayAudioCommand
   | StopPlaybackCommand
   | GetStatusCommand
@@ -53,6 +89,14 @@ export type TranscriptEvent = {
   confidence?: number;
 };
 
+export type SpeakStartedEvent = {
+  event: "speak_started";
+};
+
+export type SpeakDoneEvent = {
+  event: "speak_done";
+};
+
 export type PlaybackDoneEvent = {
   event: "playback_done";
 };
@@ -61,6 +105,7 @@ export type StatusEvent = {
   event: "status";
   capturing: boolean;
   playing: boolean;
+  speaking: boolean;
 };
 
 export type ErrorEvent = {
@@ -72,6 +117,8 @@ export type AudioEvent =
   | ReadyEvent
   | VadEvent
   | TranscriptEvent
+  | SpeakStartedEvent
+  | SpeakDoneEvent
   | PlaybackDoneEvent
   | StatusEvent
   | ErrorEvent;

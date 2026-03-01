@@ -46,8 +46,12 @@ const plugin = {
         const modelsDir = resolveModelsDir(ctx.stateDir);
         setStateDir(ctx.stateDir);
 
+        // If NOISY_CLAW_STT_PROVIDER is set, skip local Whisper download
+        const sttProvider = process.env.NOISY_CLAW_STT_PROVIDER ?? "whisper";
+
         const result = await ensureModels({
           modelsDir,
+          sttProvider,
           onStatus: (msg) => ctx.logger.info(msg),
           onProgress: (p) => {
             if (p.percent % 25 === 0) {

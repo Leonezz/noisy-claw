@@ -1,18 +1,25 @@
-import type { AudioEvent } from "../../ipc/protocol.js";
+import type { AudioEvent, SttConfig } from "../../ipc/protocol.js";
 import type { AudioSubprocess } from "../../ipc/subprocess.js";
 import type { AudioSource, AudioConfig, AudioChunk } from "../interfaces.js";
 
 export class RustLocalCapture implements AudioSource {
   private audioCallbacks: Array<(chunk: AudioChunk) => void> = [];
   private vadCallbacks: Array<(speaking: boolean) => void> = [];
+  private sttConfig: SttConfig | undefined;
 
   constructor(private readonly subprocess: AudioSubprocess) {}
+
+  /** Set cloud STT config before calling start(). */
+  setSttConfig(config: SttConfig | undefined): void {
+    this.sttConfig = config;
+  }
 
   start(config: AudioConfig): void {
     this.subprocess.send({
       cmd: "start_capture",
       device: config.device,
       sample_rate: config.sampleRate,
+      stt: this.sttConfig,
     });
   }
 
