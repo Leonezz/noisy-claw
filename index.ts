@@ -1,10 +1,11 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
-import { getActiveSession, setPluginRuntime, setStateDir } from "./src/channel/gateway.js";
+import { getActivePipeline, getActiveSession, setPluginRuntime, setStateDir } from "./src/channel/gateway.js";
 import { voiceChannelPlugin } from "./src/channel/plugin.js";
 import { VoiceSession } from "./src/channel/session.js";
 import { registerVoiceCli } from "./src/cli.js";
 import { ensureModels, resolveModelsDir } from "./src/models/manager.js";
+import { createVoiceListenTool } from "./src/tools/voice-listen.js";
 import { createVoiceModeTool } from "./src/tools/voice-mode.js";
 import { createVoiceStatusTool } from "./src/tools/voice-status.js";
 
@@ -21,6 +22,9 @@ const plugin = {
     // Inject the runtime so the gateway can dispatch transcripts to the agent
     setPluginRuntime(api.runtime);
 
+    // Set state dir early (before gateway/service start) so resolveModelsDir() works
+    setStateDir(api.runtime.state.resolveStateDir());
+
     // Register the voice channel
     api.registerChannel(voiceChannelPlugin);
 
@@ -29,6 +33,12 @@ const plugin = {
     // falling back to an idle session before the channel starts.
     api.registerTool(() => createVoiceModeTool(getActiveSession() ?? fallbackSession));
     api.registerTool(() => createVoiceStatusTool(getActiveSession() ?? fallbackSession));
+    api.registerTool(() =>
+      createVoiceListenTool({
+        session: getActiveSession() ?? fallbackSession,
+        getPipeline: getActivePipeline,
+      }),
+    );
 
     // CLI: `openclaw voice setup` / `openclaw voice models`
     api.registerCli(
@@ -44,7 +54,6 @@ const plugin = {
       id: "noisy-claw-models",
       start: async (ctx) => {
         const modelsDir = resolveModelsDir(ctx.stateDir);
-        setStateDir(ctx.stateDir);
 
         // If NOISY_CLAW_STT_PROVIDER is set, skip local Whisper download
         const sttProvider = process.env.NOISY_CLAW_STT_PROVIDER ?? "whisper";

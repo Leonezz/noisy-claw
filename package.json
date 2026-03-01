@@ -4,6 +4,8 @@
   "description": "OpenClaw voice channel plugin — bidirectional voice as a first-class channel",
   "type": "module",
   "dependencies": {
+    "@sinclair/typebox": "^0.34.48",
+    "commander": "^14.0.3",
     "zod": "^4.3.6"
   },
   "peerDependencies": {

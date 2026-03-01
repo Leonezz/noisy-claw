@@ -28,7 +28,9 @@ export class PipelineCoordinator {
   private readonly components: PipelineComponents;
   private messageCallbacks: Array<(message: string, metadata: SegmentMetadata) => void> = [];
   private active = false;
+  private paused = false;
   private echoSuppressed = false;
+  private currentConfig: PipelineConfig | null = null;
 
   constructor(components: PipelineComponents) {
     this.components = components;
@@ -77,6 +79,8 @@ export class PipelineCoordinator {
   start(config: PipelineConfig): void {
     if (this.active) return;
     this.active = true;
+    this.paused = false;
+    this.currentConfig = config;
     // Pass cloud STT config to audio source if available
     const source = this.components.audioSource as { setSttConfig?: (c: unknown) => void };
     if (typeof source.setSttConfig === "function") {
@@ -89,9 +93,27 @@ export class PipelineCoordinator {
   stop(): void {
     if (!this.active) return;
     this.active = false;
+    this.paused = false;
     this.components.audioSource.stop();
     this.components.sttProvider.stop();
     this.components.segmentation.flush();
+  }
+
+  pause(): void {
+    if (!this.active || this.paused) return;
+    this.paused = true;
+    this.components.audioSource.stop();
+    this.components.segmentation.flush();
+  }
+
+  resume(): void {
+    if (!this.active || !this.paused || !this.currentConfig) return;
+    this.paused = false;
+    this.components.audioSource.start(this.currentConfig.audio);
+  }
+
+  get isPaused(): boolean {
+    return this.paused;
   }
 
   async speak(text: string): Promise<void> {

@@ -30,7 +30,7 @@ export async function dispatchVoiceTranscript(
 
   const msgCtx = {
     Body: transcript,
-    BodyForAgent: transcript,
+    BodyForAgent: `[Voice input from microphone]: ${transcript}`,
     RawBody: transcript,
     CommandBody: transcript,
     Transcript: transcript,

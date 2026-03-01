@@ -230,6 +230,9 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       sttConfig,
     });
 
+    // Mark session as active and listening
+    session.update(session.start());
+
     ctx.setStatus({
       accountId: account.accountId,
       name: "Voice (active)",
@@ -244,6 +247,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
         () => {
           subprocess.stop();
           pipeline.stop();
+          session.update(session.stop());
           activePipeline = null;
           activeSession = null;
           activeSubprocess = null;

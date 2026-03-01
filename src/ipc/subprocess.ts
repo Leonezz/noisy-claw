@@ -108,6 +108,25 @@ export class AudioSubprocess {
     this.trySend({ cmd: "stop_speaking" });
   }
 
+  /** Pause audio capture (stop_capture without shutting down). */
+  pauseCapture(): void {
+    this.trySend({ cmd: "stop_capture" });
+  }
+
+  /** Resume audio capture with the given config. */
+  resumeCapture(config: {
+    device?: string;
+    sample_rate?: number;
+    stt?: SttConfig;
+  }): void {
+    this.send({
+      cmd: "start_capture",
+      device: config.device,
+      sample_rate: config.sample_rate,
+      stt: config.stt,
+    });
+  }
+
   stop(): void {
     if (this.process) {
       this.trySend({ cmd: "shutdown" });
