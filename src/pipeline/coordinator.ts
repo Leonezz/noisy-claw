@@ -3,7 +3,6 @@ import type {
   AudioSource,
   STTProvider,
   SegmentationEngine,
-  TTSProvider,
   AudioOutput,
   AudioConfig,
   STTConfig,
@@ -20,7 +19,6 @@ export type PipelineComponents = {
   audioSource: AudioSource;
   sttProvider: STTProvider;
   segmentation: SegmentationEngine;
-  ttsProvider: TTSProvider;
   audioOutput: AudioOutput;
 };
 
@@ -40,14 +38,34 @@ export class PipelineCoordinator {
   private wireComponents(): void {
     const { audioSource, sttProvider, segmentation, audioOutput } = this.components;
 
-    // AudioSource VAD -> SegmentationEngine + echo cancel
-    audioSource.onVAD((speaking) => {
-      segmentation.onVAD(speaking);
+    // Interruption detection: VAD during echo suppression triggers barge-in.
+    // Rust hybrid VAD gate already requires ~192ms of sustained speech at 0.85
+    // threshold before emitting Vad{speaking:true}, so we only add a short
+    // confirmation window here to avoid double-gating.
+    let interruptTimer: ReturnType<typeof setTimeout> | null = null;
+    const INTERRUPT_THRESHOLD_MS = 50;
 
-      // Interruption: user speaks during playback
-      if (speaking && this.echoSuppressed) {
-        audioOutput.stop();
-        this.echoSuppressed = false;
+    // AudioSource VAD -> SegmentationEngine (or interruption during echo suppression)
+    audioSource.onVAD((speaking) => {
+      if (!this.echoSuppressed) {
+        segmentation.onVAD(speaking);
+        return;
+      }
+
+      // During echo suppression: detect sustained speech as user interruption
+      if (speaking) {
+        if (!interruptTimer) {
+          interruptTimer = setTimeout(() => {
+            interruptTimer = null;
+            audioOutput.stop();
+            this.echoSuppressed = false;
+          }, INTERRUPT_THRESHOLD_MS);
+        }
+      } else {
+        if (interruptTimer) {
+          clearTimeout(interruptTimer);
+          interruptTimer = null;
+        }
       }
     });
 
@@ -82,6 +100,7 @@ export class PipelineCoordinator {
     this.paused = false;
     this.currentConfig = config;
     // Pass cloud STT config to audio source if available
+    console.log(`[noisy-claw] pipeline.start: sttConfig present=${!!config.sttConfig}, provider=${config.sttConfig?.provider}`);
     const source = this.components.audioSource as { setSttConfig?: (c: unknown) => void };
     if (typeof source.setSttConfig === "function") {
       source.setSttConfig(config.sttConfig);
@@ -117,9 +136,22 @@ export class PipelineCoordinator {
   }
 
   async speak(text: string): Promise<void> {
-    const audioPath = await this.components.ttsProvider.synthesize(text);
     this.echoSuppressed = true;
-    await this.components.audioOutput.play(audioPath);
+    await this.components.audioOutput.speak(text);
+  }
+
+  speakStart(): void {
+    this.echoSuppressed = true;
+    this.components.audioOutput.speakStart?.();
+  }
+
+  speakChunk(text: string): void {
+    this.components.audioOutput.speakChunk?.(text);
+  }
+
+  async speakEnd(): Promise<void> {
+    await this.components.audioOutput.speakEnd?.();
+    this.echoSuppressed = false;
   }
 
   onMessage(cb: (message: string, metadata: SegmentMetadata) => void): void {

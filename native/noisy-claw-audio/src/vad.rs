@@ -95,6 +95,10 @@ impl VoiceActivityDetector {
         Ok(transitions)
     }
 
+    pub fn set_threshold(&mut self, threshold: f32) {
+        self.threshold = threshold;
+    }
+
     pub fn is_speaking(&self) -> bool {
         self.triggered
     }

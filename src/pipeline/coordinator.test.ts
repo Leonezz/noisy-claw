@@ -4,7 +4,6 @@ import type {
   AudioSource,
   STTProvider,
   SegmentationEngine,
-  TTSProvider,
   AudioOutput,
   AudioChunk,
   TranscriptSegment,
@@ -46,12 +45,9 @@ function createMockComponents(): PipelineComponents & {
     flush: vi.fn(() => null),
   };
 
-  const ttsProvider: TTSProvider = {
-    synthesize: vi.fn(async () => "/tmp/test.mp3"),
-  };
-
   const audioOutput: AudioOutput = {
     play: vi.fn(async () => {}),
+    speak: vi.fn(async () => {}),
     stop: vi.fn(),
     isPlaying: vi.fn(() => false),
     onDone: (cb) => outputDoneCbs.push(cb),
@@ -61,7 +57,6 @@ function createMockComponents(): PipelineComponents & {
     audioSource,
     sttProvider,
     segmentation,
-    ttsProvider,
     audioOutput,
     _audioVadCbs: audioVadCbs,
     _audioChunkCbs: audioChunkCbs,
@@ -166,23 +161,59 @@ describe("PipelineCoordinator", () => {
     expect(messageCb).toHaveBeenCalledWith("hello world", metadata);
   });
 
-  it("speak() calls TTS then plays audio with echo suppression", async () => {
+  it("speak() delegates to audioOutput.speak() with echo suppression", async () => {
     await coordinator.speak("test message");
 
-    expect(mocks.ttsProvider.synthesize).toHaveBeenCalledWith("test message");
-    expect(mocks.audioOutput.play).toHaveBeenCalledWith("/tmp/test.mp3");
+    expect(mocks.audioOutput.speak).toHaveBeenCalledWith("test message");
   });
 
-  it("interruption: user speaking during playback stops output", async () => {
-    // Start speaking (triggers echo suppression via speak())
+  it("VAD events suppressed during echo suppression", async () => {
+    // Start speaking (triggers echo suppression)
     await coordinator.speak("response");
 
-    // Simulate user speaking during playback — interruption
+    // Brief VAD during playback — should NOT forward to segmentation
     for (const cb of mocks._audioVadCbs) {
       cb(true);
     }
 
+    expect(mocks.segmentation.onVAD).not.toHaveBeenCalled();
+  });
+
+  it("sustained VAD during echo suppression triggers interruption", async () => {
+    vi.useFakeTimers();
+    await coordinator.speak("response");
+
+    // VAD starts — no immediate interruption
+    for (const cb of mocks._audioVadCbs) {
+      cb(true);
+    }
+    expect(mocks.audioOutput.stop).not.toHaveBeenCalled();
+
+    // After 50ms confirmation window → interruption
+    // (Rust hybrid VAD already requires ~192ms sustained speech before emitting)
+    vi.advanceTimersByTime(50);
     expect(mocks.audioOutput.stop).toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+
+  it("interrupted VAD during echo suppression does not trigger interruption", async () => {
+    vi.useFakeTimers();
+    await coordinator.speak("response");
+
+    // VAD on for 20ms, then off (brief noise — below 50ms threshold)
+    for (const cb of mocks._audioVadCbs) {
+      cb(true);
+    }
+    vi.advanceTimersByTime(20);
+    for (const cb of mocks._audioVadCbs) {
+      cb(false);
+    }
+    vi.advanceTimersByTime(100);
+
+    expect(mocks.audioOutput.stop).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
   });
 
   it("echo suppression clears when playback finishes", async () => {

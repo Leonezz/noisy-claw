@@ -8,7 +8,6 @@ import type { AudioEvent, SttConfig, TtsConfig } from "../ipc/protocol.js";
 import { AudioSubprocess } from "../ipc/subprocess.js";
 import { resolveModelsDir as resolveFromManager } from "../models/manager.js";
 import { PipelineCoordinator, type PipelineComponents } from "../pipeline/coordinator.js";
-import type { TTSProvider } from "../pipeline/interfaces.js";
 import { RustLocalPlayback } from "../pipeline/output/rust-playback.js";
 import { VADSilenceSegmentation } from "../pipeline/segmentation/vad-silence.js";
 import { RustLocalCapture } from "../pipeline/sources/rust-capture.js";
@@ -21,7 +20,6 @@ import { VoiceSession } from "./session.js";
 let activePipeline: PipelineCoordinator | null = null;
 let activeSession: VoiceSession | null = null;
 let activeSubprocess: AudioSubprocess | null = null;
-let injectedTtsProvider: TTSProvider | null = null;
 let injectedRuntime: PluginRuntime | null = null;
 let injectedStateDir: string | null = null;
 
@@ -31,14 +29,6 @@ export function getActivePipeline(): PipelineCoordinator | null {
 
 export function getActiveSession(): VoiceSession | null {
   return activeSession;
-}
-
-/**
- * Inject the TTS provider at plugin registration time.
- * Called from index.ts where the OpenClaw runtime is available.
- */
-export function setTTSProvider(provider: TTSProvider): void {
-  injectedTtsProvider = provider;
 }
 
 /**
@@ -71,8 +61,10 @@ function resolveApiKey(
 
 export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = {
   startAccount: async (ctx: ChannelGatewayContext<ResolvedVoiceAccount>) => {
+    console.log("[noisy-claw] startAccount called");
     const { account, abortSignal } = ctx;
     const config = account.config;
+    console.log(`[noisy-claw] starting voice gateway, stt=${config.stt?.provider}, tts=${config.tts?.provider}`);
 
     const binaryPath = resolveBinaryPath();
     const modelsDir = resolveModelsDir();
@@ -162,28 +154,15 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       silenceThresholdMs: config.conversation.endOfTurnSilence,
     });
 
-    // Create TTS provider that delegates to Rust subprocess when cloud TTS configured,
-    // otherwise falls back to injected provider (OpenClaw core TTS)
-    const ttsProviderImpl: TTSProvider = ttsConfig
-      ? {
-          synthesize: async (text: string) => {
-            // Cloud TTS: send speak command to Rust subprocess
-            // The Rust side handles synthesis + playback
-            subprocess.speak(text, ttsConfig);
-            return ""; // Path not needed — Rust handles playback internally
-          },
-        }
-      : injectedTtsProvider ?? {
-          synthesize: async () => {
-            throw new Error("No TTS provider configured");
-          },
-        };
+    // Pass TTS config to playback — Rust subprocess handles TTS + playback in one step
+    if (ttsConfig) {
+      rustPlayback.setTtsConfig(ttsConfig);
+    }
 
     const components: PipelineComponents = {
       audioSource: rustCapture,
       sttProvider: rustSTT,
       segmentation,
-      ttsProvider: ttsProviderImpl,
       audioOutput: rustPlayback,
     };
 
@@ -204,6 +183,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
         runtime: injectedRuntime,
         cfg: ctx.cfg as unknown as Record<string, unknown>,
         accountId: account.accountId,
+        getPipeline: getActivePipeline,
       };
 
       console.log(

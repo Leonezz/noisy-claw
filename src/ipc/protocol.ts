@@ -39,6 +39,20 @@ export type SpeakCommand = {
   tts: TtsConfig;
 };
 
+export type SpeakStartCommand = {
+  cmd: "speak_start";
+  tts: TtsConfig;
+};
+
+export type SpeakChunkCommand = {
+  cmd: "speak_chunk";
+  text: string;
+};
+
+export type SpeakEndCommand = {
+  cmd: "speak_end";
+};
+
 export type StopSpeakingCommand = {
   cmd: "stop_speaking";
 };
@@ -64,6 +78,9 @@ export type Command =
   | StartCaptureCommand
   | StopCaptureCommand
   | SpeakCommand
+  | SpeakStartCommand
+  | SpeakChunkCommand
+  | SpeakEndCommand
   | StopSpeakingCommand
   | PlayAudioCommand
   | StopPlaybackCommand

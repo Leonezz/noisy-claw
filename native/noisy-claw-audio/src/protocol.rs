@@ -39,6 +39,13 @@ pub enum Command {
         text: String,
         tts: TtsConfig,
     },
+    SpeakStart {
+        tts: TtsConfig,
+    },
+    SpeakChunk {
+        text: String,
+    },
+    SpeakEnd,
     StopSpeaking,
     PlayAudio {
         path: String,
@@ -298,6 +305,9 @@ mod tests {
             r#"{"cmd":"start_capture","stt":{"provider":"whisper"}}"#,
             r#"{"cmd":"stop_capture"}"#,
             r#"{"cmd":"speak","text":"hi","tts":{"provider":"aliyun"}}"#,
+            r#"{"cmd":"speak_start","tts":{"provider":"aliyun"}}"#,
+            r#"{"cmd":"speak_chunk","text":"Hello world."}"#,
+            r#"{"cmd":"speak_end"}"#,
             r#"{"cmd":"stop_speaking"}"#,
             r#"{"cmd":"play_audio","path":"/tmp/test.mp3"}"#,
             r#"{"cmd":"stop_playback"}"#,

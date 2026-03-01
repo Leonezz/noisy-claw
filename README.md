@@ -2,80 +2,73 @@
 
 OpenClaw voice channel plugin — bidirectional voice as a first-class channel.
 
-Noisy Claw captures audio from your microphone, detects speech with Silero VAD, transcribes it with Whisper, and delivers the text to the OpenClaw agent. Agent responses are delivered back through the voice channel (TTS support is planned for a future release).
+Speak to your agent, hear it respond. Noisy Claw captures audio from your microphone, detects speech with Silero VAD, transcribes it (cloud or local), and delivers the text to the OpenClaw agent. Agent responses are streamed sentence-by-sentence through TTS and played back in real time, with echo cancellation and barge-in support.
+
+## Features
+
+- **Streaming TTS** — agent responses are split at sentence boundaries and synthesized as they arrive, minimizing time-to-first-audio
+- **Barge-in** — speak over the agent to interrupt; playback stops and a new turn begins
+- **Echo cancellation** — WebRTC AEC3 removes speaker output from the microphone signal so the system doesn't hear itself
+- **Cloud STT/TTS** — Aliyun DashScope via WebSocket (paraformer-realtime-v2 for STT, cosyvoice-v3-flash for TTS)
+- **Local STT fallback** — Whisper.cpp when no cloud provider is configured
+- **Agent tools** — `voice_speak`, `voice_listen`, `voice_mode`, `voice_status`
+- **VAD-based turn detection** — configurable silence threshold for end-of-turn detection
 
 ## Architecture
 
 ```
-Microphone
-    |
-    v
-┌───────────────────────────────────────────┐
-│  Rust audio engine (noisy-claw-audio)     │
-│  capture → resample → VAD → STT (Whisper) │
-└───────────────┬───────────────────────────┘
-                │ IPC (JSON over stdin/stdout)
-                v
-┌───────────────────────────────────────────┐
-│  TypeScript plugin layer                  │
-│  pipeline coordinator → session → agent   │
-└───────────────────────────────────────────┘
+TypeScript (OpenClaw plugin)           Rust (native audio engine)
+┌────────────────────────────┐        ┌─────────────────────────────┐
+│  index.ts                  │        │  noisy-claw-audio           │
+│  ├─ channel/gateway        │ stdin  │  ├─ capture (cpal)          │
+│  ├─ channel/dispatch       │ ─────► │  ├─ VAD (Silero ONNX)       │
+│  ├─ pipeline/coordinator   │ stdout │  ├─ AEC (WebRTC AEC3)       │
+│  ├─ pipeline/output        │ ◄───── │  ├─ output (cpal ring buf)  │
+│  ├─ ipc/subprocess         │  JSON  │  ├─ cloud STT/TTS (WS)      │
+│  └─ tools/*                │        │  └─ local STT (Whisper)     │
+└────────────────────────────┘        └─────────────────────────────┘
 ```
 
-The Rust binary handles all real-time audio processing. The TypeScript layer manages session state, pipeline coordination, and integration with the OpenClaw plugin SDK.
+The Rust binary handles all real-time audio: capture, resampling, VAD, echo cancellation, STT, TTS synthesis, and playback. The TypeScript layer manages the OpenClaw plugin lifecycle, pipeline coordination, sentence-boundary dispatch, and integration with the plugin SDK. Communication is JSON-over-stdio.
 
 ## Prerequisites
 
 - [Rust](https://rustup.rs/) (stable toolchain)
-- Node.js 22+
-- pnpm (workspace root uses pnpm)
-- A working microphone
+- Node.js 20+
+- pnpm
+- macOS (CoreAudio — Linux/Windows support planned)
 
 ## Setup
 
-### 1. Download models
-
-The audio engine requires two model files placed in `extensions/noisy-claw/models/`:
+### 1. Install dependencies
 
 ```bash
-mkdir -p extensions/noisy-claw/models
-
-# Silero VAD v5 (~2.3 MB)
-curl -L -o extensions/noisy-claw/models/silero_vad.onnx \
-  "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx"
-
-# Whisper base model (~141 MB)
-curl -L -o extensions/noisy-claw/models/ggml-base.bin \
-  "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin"
+pnpm install
 ```
 
 ### 2. Build the Rust audio engine
 
 ```bash
-cd extensions/noisy-claw/native/noisy-claw-audio
+cd native/noisy-claw-audio
 cargo build --release
 ```
 
-The binary is built to `target/release/noisy-claw-audio`.
+### 3. Models
 
-### 3. Install dependencies
+Models (Silero VAD, optionally Whisper base) are auto-downloaded on first run via the `noisy-claw-models` service. No manual download is needed.
 
-From the repository root:
+To force a manual download:
 
 ```bash
-pnpm install
-pnpm build
+openclaw voice setup
 ```
 
 ### 4. Configure OpenClaw
 
-Add the voice channel to your OpenClaw config at `~/.openclaw/openclaw.json`:
+Add the voice channel to your OpenClaw config:
 
 ```json
 {
-  "plugins": {
-    "enabled": true
-  },
   "channels": {
     "voice": {
       "enabled": true
@@ -84,24 +77,9 @@ Add the voice channel to your OpenClaw config at `~/.openclaw/openclaw.json`:
 }
 ```
 
-### 5. Run the gateway
-
-```bash
-node --import tsx dist/entry.js gateway --dev
-```
-
-You should see:
-
-```
-[noisy-claw] No TTS provider injected — voice responses will be text-only
-[noisy-claw-audio] capture started
-```
-
-The plugin is now listening on your microphone. Speak and the transcribed text will be delivered to the agent.
-
 ## Configuration
 
-All fields are optional. Defaults are shown below:
+All fields are optional. Shown below with defaults:
 
 ```json
 {
@@ -115,12 +93,20 @@ All fields are optional. Defaults are shown below:
         "device": "default"
       },
       "stt": {
-        "backend": "whisper",
-        "model": "base",
-        "language": "en"
+        "provider": "aliyun",
+        "model": "paraformer-realtime-v2",
+        "languages": ["zh", "en"],
+        "apiKey": "...",
+        "endpoint": null,
+        "extra": {}
       },
       "tts": {
-        "enabled": true
+        "enabled": true,
+        "provider": "aliyun",
+        "model": "cosyvoice-v3-flash",
+        "voice": "longanyang",
+        "sampleRate": 16000,
+        "speed": 1.0
       },
       "conversation": {
         "endOfTurnSilence": 700,
@@ -131,76 +117,132 @@ All fields are optional. Defaults are shown below:
 }
 ```
 
-| Field                           | Description                                                                   |
-| ------------------------------- | ----------------------------------------------------------------------------- |
-| `audio.device`                  | Input device name, or `"default"` for system default                          |
-| `audio.sampleRate`              | Target sample rate in Hz. The capture resamples from the device's native rate |
-| `stt.model`                     | Whisper model size: `tiny`, `base`, `small`, `medium`, `large`                |
-| `stt.language`                  | Language code for transcription (e.g., `en`, `zh`, `ja`)                      |
-| `conversation.endOfTurnSilence` | Milliseconds of silence before a turn is considered complete                  |
+| Field | Description |
+|-------|-------------|
+| `audio.device` | Input device name, or `"default"` for system default |
+| `audio.sampleRate` | Capture sample rate in Hz (device resamples to this) |
+| `stt.provider` | `"aliyun"` for cloud, `"whisper"` for local |
+| `stt.model` | STT model name (cloud: `paraformer-realtime-v2`; local: `base`, `small`, etc.) |
+| `stt.languages` | Language hints for cloud STT (e.g., `["zh", "en"]`) |
+| `stt.apiKey` | API key for cloud STT (or set `DASHSCOPE_API_KEY` env var) |
+| `tts.provider` | TTS provider (currently `"aliyun"`) |
+| `tts.model` | TTS model name (e.g., `cosyvoice-v3-flash`) |
+| `tts.voice` | Voice name (e.g., `longanyang`) |
+| `tts.speed` | Speech speed multiplier |
+| `conversation.endOfTurnSilence` | Milliseconds of silence before a turn is complete |
+| `conversation.interruptible` | Allow barge-in during agent speech |
 
-## Agent tools
+## Agent Tools
 
-The plugin registers two tools that the agent can use:
+The plugin registers four tools available to the agent:
 
-- **`voice_mode`** — Switch the voice channel mode. Only `conversation` mode is implemented; `listen` and `dictation` modes are planned.
-- **`voice_status`** — Get the current state of the voice session (active, mode, duration, segment count).
+| Tool | Description |
+|------|-------------|
+| `voice_speak` | Synthesize and play text aloud (independent of the agent's text reply) |
+| `voice_listen` | Start or stop microphone listening |
+| `voice_mode` | Switch voice channel mode (currently only `conversation`) |
+| `voice_status` | Query session state: active, mode, duration, segment count, listening, speaking |
 
-## Running tests
+## IPC Protocol
+
+Commands (TypeScript -> Rust, JSON per line on stdin):
+
+| Command | Description |
+|---------|-------------|
+| `start_capture` | Begin mic capture with optional cloud STT config |
+| `stop_capture` | Stop mic capture |
+| `speak` | Synthesize and play full text (batch mode) |
+| `speak_start` | Begin streaming TTS session |
+| `speak_chunk` | Send text chunk for synthesis |
+| `speak_end` | End streaming TTS session |
+| `stop_speaking` | Interrupt TTS playback |
+| `play_audio` | Play a pre-recorded audio file |
+| `stop_playback` | Stop file playback |
+| `get_status` | Query engine state |
+| `shutdown` | Terminate engine |
+
+Events (Rust -> TypeScript, JSON per line on stdout):
+
+| Event | Description |
+|-------|-------------|
+| `ready` | Engine initialized |
+| `vad` | Voice activity: `{speaking: bool}` |
+| `transcript` | STT result: `{text, is_final, start, end, confidence?}` |
+| `speak_started` | TTS synthesis began |
+| `speak_done` | TTS playback completed |
+| `playback_done` | File playback completed |
+| `status` | Current state: `{capturing, playing, speaking}` |
+| `error` | Error message |
+
+## Development
 
 ```bash
-# TypeScript tests (from repo root)
-npx vitest run extensions/noisy-claw
+# TypeScript tests
+npx vitest run
 
 # Rust tests
-cd extensions/noisy-claw/native/noisy-claw-audio
+cd native/noisy-claw-audio
 cargo test
+
+# Run with debug logging
+RUST_LOG=noisy_claw_audio=debug cargo run --release
 ```
 
-## Project structure
+## Project Structure
 
 ```
-extensions/noisy-claw/
-  index.ts                  # Plugin entry point
-  openclaw.plugin.json      # Plugin manifest
-  models/                   # VAD and STT model files (not checked in)
-  native/noisy-claw-audio/  # Rust audio engine
-    src/
-      main.rs               # IPC command loop, pipeline orchestration
-      capture.rs            # Audio capture with resample and channel mixing
-      vad.rs                # Silero VAD v5 inference
-      stt.rs                # Whisper STT
-      playback.rs           # Audio playback
-      protocol.rs           # IPC message types
+index.ts                      # Plugin entry point
+skills/SKILL.md               # Agent-facing skill description
+native/noisy-claw-audio/      # Rust audio engine
   src/
-    channel/
-      config.ts             # Voice config adapter
-      gateway.ts            # Gateway adapter (subprocess lifecycle)
-      outbound.ts           # Outbound adapter (TTS delivery)
-      plugin.ts             # Channel plugin definition
-      session.ts            # Voice session state machine
-    config/
-      schema.ts             # Zod config schema
-      defaults.ts           # Default configuration values
-    ipc/
-      protocol.ts           # TypeScript IPC protocol types
-      subprocess.ts         # Subprocess manager
-    pipeline/
-      coordinator.ts        # Pipeline coordinator
-      interfaces.ts         # Pipeline component interfaces
-      sources/              # Audio source implementations
-      segmentation/         # VAD-based segmentation
-      stt/                  # STT provider implementations
-      tts/                  # TTS provider implementations
-      output/               # Audio output implementations
-    tools/
-      voice-mode.ts         # voice_mode agent tool
-      voice-status.ts       # voice_status agent tool
+    main.rs                   # IPC loop, pipeline orchestration
+    capture.rs                # Audio capture (cpal), resample, channel mixing
+    vad.rs                    # Silero VAD v5 inference (ONNX)
+    aec.rs                    # Echo cancellation (WebRTC AEC3 at 48kHz)
+    output.rs                 # Streaming output (cpal ring buffer + AEC ref tap)
+    stt.rs                    # Local STT (Whisper.cpp)
+    playback.rs               # File-based audio playback
+    audio_utils.rs            # Resample, PCM conversion utilities
+    protocol.rs               # IPC command/event types
+    cloud/
+      traits.rs               # SpeechRecognizer, StreamingSpeechSynthesizer, TtsSession
+      aliyun/
+        dashscope_stt.rs      # DashScope real-time ASR (WebSocket)
+        dashscope_tts.rs      # DashScope streaming TTS (WebSocket)
+        dashscope_protocol.rs # DashScope wire protocol helpers
+src/
+  channel/
+    config.ts                 # Voice config adapter
+    gateway.ts                # Gateway adapter (subprocess lifecycle)
+    dispatch.ts               # Sentence-boundary dispatch for streaming TTS
+    outbound.ts               # Outbound adapter (routes agent replies to TTS)
+    plugin.ts                 # Channel plugin definition
+    session.ts                # Voice session state machine
+  config/
+    schema.ts                 # Zod config schema
+    defaults.ts               # Default configuration values
+  ipc/
+    protocol.ts               # TypeScript IPC protocol types
+    subprocess.ts             # Subprocess manager
+  pipeline/
+    coordinator.ts            # Pipeline coordinator (VAD, echo suppression, barge-in)
+    interfaces.ts             # Pipeline component interfaces
+    sources/                  # Audio source implementations
+    segmentation/             # VAD-based turn segmentation
+    output/                   # Audio output (RustLocalPlayback)
+  tools/
+    voice-speak.ts            # voice_speak agent tool
+    voice-listen.ts           # voice_listen agent tool
+    voice-mode.ts             # voice_mode agent tool
+    voice-status.ts           # voice_status agent tool
+  models/
+    manager.ts                # Model auto-download
+  cli.ts                      # CLI commands (openclaw voice setup/models)
 ```
 
-## Current limitations
+## Current Limitations
 
-- **TTS is not wired** — Agent responses are text-only. The outbound adapter is ready for a TTS provider but none is injected yet.
-- **Only `conversation` mode** — `listen` and `dictation` modes return "not yet implemented".
-- **Linear interpolation resampler** — Adequate for voice but not production-grade for music or wide-band audio.
-- **No echo cancellation** — If using speakers instead of headphones, the agent's TTS output may be picked up by the microphone.
+- **Only `conversation` mode** — `listen` and `dictation` modes return "not yet implemented"
+- **Only Aliyun DashScope** — cloud provider architecture is trait-based and extensible, but only Aliyun is implemented
+- **macOS only** — uses CoreAudio via cpal; Linux ALSA/PulseAudio and Windows WASAPI should work but are untested
+- **Linear interpolation resampler** — adequate for voice but has no anti-aliasing filter; AEC runs at 48kHz to avoid downsampling the render reference

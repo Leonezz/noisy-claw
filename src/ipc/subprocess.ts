@@ -43,10 +43,15 @@ export class AudioSubprocess {
       env.NOISY_CLAW_STT_MODEL = this.options.sttModel;
     }
 
+    console.log(`[noisy-claw] spawning subprocess: ${this.options.binaryPath}`);
+    console.log(`[noisy-claw] NOISY_CLAW_MODELS_DIR=${env.NOISY_CLAW_MODELS_DIR ?? "(unset)"}`);
+
     this.process = spawn(this.options.binaryPath, [], {
       stdio: ["pipe", "pipe", "pipe"],
       env,
     });
+
+    console.log(`[noisy-claw] subprocess pid=${this.process.pid ?? "failed"}`);
 
     // Absorb EPIPE errors on stdin — the subprocess may exit before we finish writing
     this.process.stdin?.on("error", () => {});
@@ -106,6 +111,21 @@ export class AudioSubprocess {
   /** Stop current TTS speech playback. */
   stopSpeaking(): void {
     this.trySend({ cmd: "stop_speaking" });
+  }
+
+  /** Start a streaming TTS session. */
+  speakStart(ttsConfig: TtsConfig): void {
+    this.send({ cmd: "speak_start", tts: ttsConfig });
+  }
+
+  /** Send a text chunk to the active TTS session. */
+  speakChunk(text: string): void {
+    this.send({ cmd: "speak_chunk", text });
+  }
+
+  /** Signal end of text for the active TTS session. */
+  speakEnd(): void {
+    this.send({ cmd: "speak_end" });
   }
 
   /** Pause audio capture (stop_capture without shutting down). */

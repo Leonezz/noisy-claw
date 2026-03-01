@@ -55,3 +55,22 @@ pub struct SynthesizerConfig {
 pub trait SpeechSynthesizer: Send {
     async fn synthesize(&self, text: &str, config: &SynthesizerConfig) -> Result<PathBuf>;
 }
+
+/// Streaming TTS — sends audio chunks as they arrive from the provider.
+#[async_trait]
+pub trait StreamingSpeechSynthesizer: Send {
+    async fn synthesize_streaming(
+        &self,
+        text: &str,
+        config: &SynthesizerConfig,
+        audio_tx: tokio::sync::mpsc::Sender<Vec<f32>>,
+    ) -> Result<()>;
+}
+
+/// TTS session — keeps a WebSocket open across multiple text chunks.
+#[async_trait]
+pub trait TtsSession: Send {
+    async fn send_text(&mut self, text: &str) -> Result<()>;
+    async fn finish(&mut self) -> Result<()>;
+    async fn cancel(&mut self);
+}

@@ -63,7 +63,11 @@ export interface TTSProvider {
 
 export interface AudioOutput {
   play(audioPath: string): Promise<void>;
+  speak(text: string): Promise<void>;
   stop(): void;
   isPlaying(): boolean;
   onDone(cb: () => void): void;
+  speakStart?(): void;
+  speakChunk?(text: string): void;
+  speakEnd?(): Promise<void>;
 }

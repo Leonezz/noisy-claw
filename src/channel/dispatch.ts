@@ -1,15 +1,20 @@
 import type { PluginRuntime } from "openclaw/plugin-sdk";
+import type { PipelineCoordinator } from "../pipeline/coordinator.js";
 import type { SegmentMetadata } from "../pipeline/interfaces.js";
 
 export type VoiceDispatchDeps = {
   runtime: PluginRuntime;
   cfg: Record<string, unknown>;
   accountId: string;
+  getPipeline: () => PipelineCoordinator | null;
 };
+
+// Sentence boundary: split at .!? and CJK sentence-end marks, plus newlines
+const SENTENCE_END = /[.!?。！？\n]/;
 
 /**
  * Dispatch a voice transcript to the OpenClaw agent as an inbound message.
- * The agent's reply will flow back through the voice outbound adapter.
+ * Streams the AI reply sentence-by-sentence to TTS for low-latency playback.
  */
 export async function dispatchVoiceTranscript(
   deps: VoiceDispatchDeps,
@@ -50,6 +55,44 @@ export async function dispatchVoiceTranscript(
 
   const finalizedCtx = runtime.channel.reply.finalizeInboundContext(msgCtx);
 
+  // Streaming state for sentence-boundary TTS
+  let streamStarted = false;
+  let sentCursor = 0;
+
+  function flushSentences(fullText: string, force: boolean): void {
+    const pipeline = deps.getPipeline();
+    if (!pipeline?.isActive) return;
+
+    while (sentCursor < fullText.length) {
+      const remaining = fullText.slice(sentCursor);
+      const match = SENTENCE_END.exec(remaining);
+      if (match) {
+        const end = sentCursor + match.index + match[0].length;
+        const sentence = fullText.slice(sentCursor, end).trim();
+        if (sentence) {
+          if (!streamStarted) {
+            pipeline.speakStart();
+            streamStarted = true;
+          }
+          pipeline.speakChunk(sentence);
+        }
+        sentCursor = end;
+      } else if (force) {
+        const tail = remaining.trim();
+        if (tail) {
+          if (!streamStarted) {
+            pipeline.speakStart();
+            streamStarted = true;
+          }
+          pipeline.speakChunk(tail);
+        }
+        sentCursor = fullText.length;
+      } else {
+        break;
+      }
+    }
+  }
+
   await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
     ctx: finalizedCtx,
     cfg: cfg as Parameters<
@@ -62,11 +105,28 @@ export async function dispatchVoiceTranscript(
           console.log(
             `[noisy-claw] agent reply: ${text.slice(0, 100)}${text.length > 100 ? "…" : ""}`,
           );
+          // Final delivery per block — flush remaining text
+          flushSentences(text, true);
         }
       },
       onError: (err) => {
         console.error("[noisy-claw] dispatch error:", err);
       },
     },
+    replyOptions: {
+      onPartialReply: (payload: { text?: string }) => {
+        if (payload.text) {
+          flushSentences(payload.text, false);
+        }
+      },
+    },
   });
+
+  // After all blocks delivered, signal end of TTS stream
+  if (streamStarted) {
+    const pipeline = deps.getPipeline();
+    if (pipeline?.isActive) {
+      await pipeline.speakEnd();
+    }
+  }
 }

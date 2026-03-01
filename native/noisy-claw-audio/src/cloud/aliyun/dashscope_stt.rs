@@ -1,7 +1,6 @@
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{
     connect_async,
@@ -9,6 +8,9 @@ use tokio_tungstenite::{
 };
 use uuid::Uuid;
 
+use crate::cloud::aliyun::dashscope_protocol::{
+    self, AsrParameters, DashScopeEvent,
+};
 use crate::cloud::traits::{RecognitionResult, RecognizerConfig, SpeechRecognizer};
 
 const DEFAULT_ENDPOINT: &str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference";
@@ -50,7 +52,7 @@ impl SpeechRecognizer for DashScopeRecognizer {
             .as_deref()
             .unwrap_or(DEFAULT_ENDPOINT);
 
-        let task_id = Uuid::new_v4().to_string().replace('-', "");
+        let task_id = Uuid::new_v4().to_string();
 
         // Build WebSocket request with auth header
         let mut request = endpoint.into_client_request()
@@ -67,30 +69,26 @@ impl SpeechRecognizer for DashScopeRecognizer {
             .context("WebSocket connection failed")?;
         let (mut ws_write, mut ws_read) = ws_stream.split();
 
-        // Build run-task message
-        let languages: Vec<&str> = config.languages.iter().map(|s| s.as_str()).collect();
-        let run_task = json!({
-            "header": {
-                "action": "run-task",
-                "task_id": task_id,
-                "streaming": "duplex"
+        // Build and send run-task message
+        let run_task_str = dashscope_protocol::run_task_asr(
+            &task_id,
+            &config.model,
+            AsrParameters {
+                format: "pcm".to_string(),
+                sample_rate: config.sample_rate,
+                language_hints: config.languages.clone(),
+                disfluency_removal_enabled: true,
+                semantic_punctuation_enabled: true,
+                punctuation_prediction_enabled: true,
+                max_sentence_silence: 800,
+                multi_threshold_mode_enabled: true,
+                heartbeat: true,
             },
-            "payload": {
-                "task_group": "audio",
-                "task": "asr",
-                "function": "recognition",
-                "model": config.model,
-                "parameters": {
-                    "format": "pcm",
-                    "sample_rate": config.sample_rate,
-                    "language_hints": languages
-                },
-                "input": {}
-            }
-        });
+        );
 
+        tracing::info!("DashScope STT sending run-task: {run_task_str}");
         ws_write
-            .send(Message::Text(run_task.to_string().into()))
+            .send(Message::Text(run_task_str.into()))
             .await
             .context("failed to send run-task")?;
 
@@ -98,27 +96,28 @@ impl SpeechRecognizer for DashScopeRecognizer {
         loop {
             match ws_read.next().await {
                 Some(Ok(Message::Text(ref text))) => {
-                    let v: serde_json::Value = serde_json::from_str(text)
-                        .context("invalid JSON from DashScope")?;
-                    let action = v["header"]["action"].as_str().unwrap_or("");
-                    match action {
-                        "task-started" => {
+                    tracing::debug!("DashScope response: {text}");
+                    match dashscope_protocol::parse_event(text)? {
+                        DashScopeEvent::TaskStarted { .. } => {
                             tracing::info!("DashScope STT task started: {task_id}");
                             break;
                         }
-                        "task-failed" => {
-                            let msg = v["header"]["message"]
-                                .as_str()
-                                .unwrap_or("unknown error");
-                            bail!("DashScope STT task-failed: {msg}");
+                        DashScopeEvent::TaskFailed { code, message, .. } => {
+                            bail!("DashScope STT task-failed: [{code}] {message}");
                         }
-                        _ => {
-                            tracing::debug!(action, "ignoring pre-start event");
+                        other => {
+                            tracing::warn!("unexpected pre-start event: {other:?}");
                         }
                     }
                 }
-                Some(Ok(Message::Close(_))) | None => {
-                    bail!("WebSocket closed before task-started");
+                Some(Ok(Message::Close(frame))) => {
+                    let reason = frame
+                        .map(|f| format!("code={}, reason={}", f.code, f.reason))
+                        .unwrap_or_else(|| "no close frame".to_string());
+                    bail!("WebSocket closed before task-started: {reason}");
+                }
+                None => {
+                    bail!("WebSocket stream ended before task-started");
                 }
                 Some(Err(e)) => bail!("WebSocket error: {e}"),
                 _ => continue,
@@ -150,51 +149,38 @@ impl SpeechRecognizer for DashScopeRecognizer {
                     Some(msg) = ws_read.next() => {
                         match msg {
                             Ok(Message::Text(ref text)) => {
-                                let v: serde_json::Value = match serde_json::from_str(text) {
-                                    Ok(v) => v,
+                                let event = match dashscope_protocol::parse_event(text) {
+                                    Ok(e) => e,
                                     Err(_) => continue,
                                 };
-                                let action = v["header"]["action"].as_str().unwrap_or("");
-                                match action {
-                                    "result-generated" => {
-                                        if let Some(output) = v["payload"]["output"].as_object() {
-                                            if let Some(sentence) = output.get("sentence") {
-                                                let text = sentence["text"]
-                                                    .as_str()
-                                                    .unwrap_or("")
-                                                    .to_string();
-                                                let begin_time = sentence["begin_time"]
-                                                    .as_f64()
-                                                    .unwrap_or(0.0);
-                                                let end_time = sentence["end_time"]
-                                                    .as_f64()
-                                                    .unwrap_or(0.0);
-                                                let is_final = sentence["sentence_end"]
-                                                    .as_bool()
-                                                    .unwrap_or(false);
-
-                                                if !text.is_empty() {
-                                                    let result = RecognitionResult {
-                                                        text,
-                                                        is_final,
-                                                        start_time: begin_time / 1000.0,
-                                                        end_time: end_time / 1000.0,
-                                                        confidence: None,
-                                                    };
-                                                    let _ = result_tx.send(result).await;
-                                                }
+                                match event {
+                                    DashScopeEvent::ResultGenerated { .. } => {
+                                        if let Some(sentence) = event.as_asr_sentence() {
+                                            if !sentence.text.is_empty() {
+                                                tracing::info!(
+                                                    text = %sentence.text,
+                                                    is_final = sentence.sentence_end,
+                                                    begin_ms = sentence.begin_time,
+                                                    end_ms = sentence.end_time,
+                                                    "STT ← transcript"
+                                                );
+                                                let result = RecognitionResult {
+                                                    text: sentence.text,
+                                                    is_final: sentence.sentence_end,
+                                                    start_time: sentence.begin_time / 1000.0,
+                                                    end_time: sentence.end_time / 1000.0,
+                                                    confidence: None,
+                                                };
+                                                let _ = result_tx.send(result).await;
                                             }
                                         }
                                     }
-                                    "task-finished" => {
+                                    DashScopeEvent::TaskFinished { .. } => {
                                         tracing::info!("DashScope STT task finished");
                                         break;
                                     }
-                                    "task-failed" => {
-                                        let msg = v["header"]["message"]
-                                            .as_str()
-                                            .unwrap_or("unknown");
-                                        tracing::error!("DashScope STT task failed: {msg}");
+                                    DashScopeEvent::TaskFailed { message, .. } => {
+                                        tracing::error!("DashScope STT task failed: {message}");
                                         break;
                                     }
                                     _ => {}
@@ -208,17 +194,8 @@ impl SpeechRecognizer for DashScopeRecognizer {
                     // Stop signal
                     Some(()) = stop_rx.recv(), if !stopped => {
                         stopped = true;
-                        let finish = json!({
-                            "header": {
-                                "action": "finish-task",
-                                "task_id": task_id_clone,
-                                "streaming": "duplex"
-                            },
-                            "payload": {
-                                "input": {}
-                            }
-                        });
-                        let _ = ws_write.send(Message::Text(finish.to_string().into())).await;
+                        let finish_str = dashscope_protocol::finish_task(&task_id_clone);
+                        let _ = ws_write.send(Message::Text(finish_str.into())).await;
                         // Keep reading until task-finished
                     }
 

@@ -1,5 +1,6 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { emptyPluginConfigSchema } from "openclaw/plugin-sdk";
+import { voiceConfigAdapter } from "./src/channel/config.js";
 import { getActivePipeline, getActiveSession, setPluginRuntime, setStateDir } from "./src/channel/gateway.js";
 import { voiceChannelPlugin } from "./src/channel/plugin.js";
 import { VoiceSession } from "./src/channel/session.js";
@@ -7,6 +8,7 @@ import { registerVoiceCli } from "./src/cli.js";
 import { ensureModels, resolveModelsDir } from "./src/models/manager.js";
 import { createVoiceListenTool } from "./src/tools/voice-listen.js";
 import { createVoiceModeTool } from "./src/tools/voice-mode.js";
+import { createVoiceSpeakTool } from "./src/tools/voice-speak.js";
 import { createVoiceStatusTool } from "./src/tools/voice-status.js";
 
 // Fallback session used when the gateway hasn't started yet.
@@ -39,6 +41,9 @@ const plugin = {
         getPipeline: getActivePipeline,
       }),
     );
+    api.registerTool(() =>
+      createVoiceSpeakTool({ getPipeline: getActivePipeline }),
+    );
 
     // CLI: `openclaw voice setup` / `openclaw voice models`
     api.registerCli(
@@ -55,8 +60,12 @@ const plugin = {
       start: async (ctx) => {
         const modelsDir = resolveModelsDir(ctx.stateDir);
 
-        // If NOISY_CLAW_STT_PROVIDER is set, skip local Whisper download
-        const sttProvider = process.env.NOISY_CLAW_STT_PROVIDER ?? "whisper";
+        // Read STT provider from channel config (not env var)
+        const account = voiceConfigAdapter.resolveAccount(
+          ctx.config as Parameters<typeof voiceConfigAdapter.resolveAccount>[0],
+        );
+        const sttProvider = account.config.stt?.provider ?? "whisper";
+        ctx.logger.info(`stt provider: ${sttProvider}`);
 
         const result = await ensureModels({
           modelsDir,

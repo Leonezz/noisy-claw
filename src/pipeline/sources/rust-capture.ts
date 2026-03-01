@@ -15,6 +15,9 @@ export class RustLocalCapture implements AudioSource {
   }
 
   start(config: AudioConfig): void {
+    console.log(
+      `[noisy-claw] RustLocalCapture.start: sttConfig=${JSON.stringify(this.sttConfig)?.slice(0, 100)}`,
+    );
     this.subprocess.send({
       cmd: "start_capture",
       device: config.device,

@@ -1,8 +1,9 @@
+pub mod dashscope_protocol;
 pub mod dashscope_stt;
 pub mod dashscope_tts;
 
 use anyhow::{bail, Result};
-use super::traits::{SpeechRecognizer, SpeechSynthesizer};
+use super::traits::{SpeechRecognizer, SpeechSynthesizer, StreamingSpeechSynthesizer};
 
 pub fn create_recognizer(model: &str) -> Result<Box<dyn SpeechRecognizer>> {
     match model {
@@ -14,6 +15,15 @@ pub fn create_recognizer(model: &str) -> Result<Box<dyn SpeechRecognizer>> {
 }
 
 pub fn create_synthesizer(model: &str) -> Result<Box<dyn SpeechSynthesizer>> {
+    match model {
+        m if m.starts_with("cosyvoice") || m.starts_with("sambert") => {
+            Ok(Box::new(dashscope_tts::DashScopeSynthesizer::new()))
+        }
+        other => bail!("unknown Aliyun TTS model: {other}"),
+    }
+}
+
+pub fn create_streaming_synthesizer(model: &str) -> Result<Box<dyn StreamingSpeechSynthesizer>> {
     match model {
         m if m.starts_with("cosyvoice") || m.starts_with("sambert") => {
             Ok(Box::new(dashscope_tts::DashScopeSynthesizer::new()))

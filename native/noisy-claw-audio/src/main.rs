@@ -1,5 +1,8 @@
+mod aec;
+mod audio_utils;
 mod capture;
 mod cloud;
+mod output;
 mod playback;
 mod protocol;
 mod stt;
@@ -19,6 +22,9 @@ use tokio::sync::mpsc;
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
+        .with_file(true)
+        .with_line_number(true)
+        .with_target(false)
         .with_env_filter(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "noisy_claw_audio=info".to_string()),
         )
@@ -47,9 +53,10 @@ async fn main() -> Result<()> {
     let mut speech_buffer: Vec<f32> = Vec::new();
     let mut speech_start_time: Option<Instant> = None;
     let mut capture_start_time: Option<Instant> = None;
-    let mut suppress_stt = false;
     let mut was_speaking = false;
     let mut is_speaking_tts = false;
+    let mut consecutive_speech_frames: u32 = 0;
+    const BARGE_IN_FRAME_COUNT: u32 = 6; // ~192ms at 32ms/window
 
     // Cloud STT state
     let mut cloud_recognizer: Option<Box<dyn SpeechRecognizer>> = None;
@@ -58,8 +65,25 @@ async fn main() -> Result<()> {
     // Audio frame receiver — set when capture starts
     let mut audio_rx: Option<mpsc::UnboundedReceiver<capture::AudioFrame>> = None;
 
-    // Playback completion receiver — set when playback starts
+    // Playback completion receiver — set when playback starts (file-based only)
     let mut playback_done_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
+
+    // AEC engine — initialized when capture starts
+    let mut aec_engine: Option<aec::EchoCanceller> = None;
+
+    // Streaming output + AEC reference tap
+    let mut streaming_output: Option<output::StreamingOutput> = None;
+    let mut reference_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>> = None;
+
+    // TTS audio chunk receiver — from streaming synthesis
+    let mut tts_chunk_rx: Option<mpsc::Receiver<Vec<f32>>> = None;
+    // Drain completion receiver — signals when streaming output buffer has fully played
+    let mut drain_rx: Option<tokio::sync::oneshot::Receiver<()>> = None;
+    // The TTS output sample rate (needed for resampling to device rate)
+    let mut tts_sample_rate: u32 = 16000;
+
+    // TTS session — keeps WebSocket open for SpeakStart/SpeakChunk/SpeakEnd
+    let mut tts_session: Option<Box<dyn cloud::traits::TtsSession>> = None;
 
     // Send ready event
     event_tx.send(Event::Ready).await?;
@@ -164,6 +188,19 @@ async fn main() -> Result<()> {
                                 }
                             }
 
+                            // Init AEC engine
+                            if aec_engine.is_none() {
+                                match aec::EchoCanceller::new() {
+                                    Ok(ec) => {
+                                        aec_engine = Some(ec);
+                                        tracing::info!("AEC engine initialized");
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(%e, "AEC init failed, continuing without echo cancellation");
+                                    }
+                                }
+                            }
+
                             // Start capture
                             match capture.start(&device, sample_rate) {
                                 Ok(rx) => {
@@ -208,8 +245,10 @@ async fn main() -> Result<()> {
                         }
 
                         Command::Speak { text, tts } => {
-                            suppress_stt = true;
                             is_speaking_tts = true;
+                            if let Some(ref mut vad) = vad_engine {
+                                vad.set_threshold(0.85);
+                            }
                             let _ = event_tx.send(Event::SpeakStarted).await;
 
                             let model = tts.model.as_deref().unwrap_or("cosyvoice-v3-flash");
@@ -221,78 +260,70 @@ async fn main() -> Result<()> {
                                         message: "TTS requires api_key".to_string(),
                                     }).await;
                                     let _ = event_tx.send(Event::SpeakDone).await;
-                                    suppress_stt = false;
                                     is_speaking_tts = false;
+                                    if let Some(ref mut vad) = vad_engine {
+                                        vad.set_threshold(0.5);
+                                    }
                                     continue;
                                 }
                             };
 
-                            match cloud::create_synthesizer(provider, model) {
+                            tts_sample_rate = tts.sample_rate.unwrap_or(16000);
+
+                            // Create fresh streaming output for each speak session
+                            match output::StreamingOutput::new(tts_sample_rate) {
+                                Ok((out, ref_rx)) => {
+                                    streaming_output = Some(out);
+                                    reference_rx = Some(ref_rx);
+                                }
+                                Err(e) => {
+                                    is_speaking_tts = false;
+                                    if let Some(ref mut vad) = vad_engine {
+                                        vad.set_threshold(0.5);
+                                    }
+                                    let _ = event_tx.send(Event::Error {
+                                        message: format!("streaming output init failed: {e}"),
+                                    }).await;
+                                    let _ = event_tx.send(Event::SpeakDone).await;
+                                    continue;
+                                }
+                            }
+
+                            match cloud::create_streaming_synthesizer(provider, model) {
                                 Ok(synthesizer) => {
                                     let synth_config = SynthesizerConfig {
                                         api_key,
                                         endpoint: tts.endpoint.clone(),
                                         model: model.to_string(),
                                         voice: tts.voice.clone().unwrap_or_else(|| "longanyang".to_string()),
-                                        format: tts.format.clone().unwrap_or_else(|| "wav".to_string()),
-                                        sample_rate: tts.sample_rate.unwrap_or(16000),
+                                        format: "pcm".to_string(), // Force PCM for streaming
+                                        sample_rate: tts_sample_rate,
                                         speed: tts.speed,
                                         extra: tts.extra.clone().unwrap_or_default(),
                                     };
 
-                                    match synthesizer.synthesize(&text, &synth_config).await {
-                                        Ok(audio_path) => {
-                                            tracing::info!(path = %audio_path.display(), "TTS synthesis complete");
+                                    // Create channel for streaming audio chunks
+                                    let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<f32>>(64);
+                                    tts_chunk_rx = Some(chunk_rx);
 
-                                            // Init playback lazily
-                                            if playback.is_none() {
-                                                match playback::AudioPlayback::new() {
-                                                    Ok(p) => playback = Some(p),
-                                                    Err(e) => {
-                                                        suppress_stt = false;
-                                                        is_speaking_tts = false;
-                                                        let _ = event_tx.send(Event::Error {
-                                                            message: format!("playback init failed: {e}"),
-                                                        }).await;
-                                                        let _ = event_tx.send(Event::SpeakDone).await;
-                                                        continue;
-                                                    }
-                                                }
-                                            }
-
-                                            let pb = playback.as_mut().unwrap();
-                                            match pb.play(&audio_path) {
-                                                Ok(player) => {
-                                                    let (done_tx, done_rx) = tokio::sync::oneshot::channel();
-                                                    playback_done_rx = Some(done_rx);
-                                                    tokio::task::spawn_blocking(move || {
-                                                        player.sleep_until_end();
-                                                        let _ = done_tx.send(());
-                                                    });
-                                                }
-                                                Err(e) => {
-                                                    suppress_stt = false;
-                                                    is_speaking_tts = false;
-                                                    let _ = event_tx.send(Event::Error {
-                                                        message: format!("playback failed: {e}"),
-                                                    }).await;
-                                                    let _ = event_tx.send(Event::SpeakDone).await;
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            suppress_stt = false;
-                                            is_speaking_tts = false;
-                                            let _ = event_tx.send(Event::Error {
+                                    // Spawn synthesis task — when it finishes, chunk_tx is
+                                    // dropped, closing the channel. Branch 5 handles cleanup.
+                                    let ev_tx = event_tx.clone();
+                                    tokio::spawn(async move {
+                                        if let Err(e) = synthesizer.synthesize_streaming(&text, &synth_config, chunk_tx).await {
+                                            tracing::error!(%e, "streaming TTS synthesis failed");
+                                            let _ = ev_tx.send(Event::Error {
                                                 message: format!("TTS synthesis failed: {e}"),
                                             }).await;
-                                            let _ = event_tx.send(Event::SpeakDone).await;
                                         }
-                                    }
+                                        // chunk_tx dropped here → channel closes → Branch 5 emits SpeakDone
+                                    });
                                 }
                                 Err(e) => {
-                                    suppress_stt = false;
                                     is_speaking_tts = false;
+                                    if let Some(ref mut vad) = vad_engine {
+                                        vad.set_threshold(0.5);
+                                    }
                                     let _ = event_tx.send(Event::Error {
                                         message: format!("TTS init failed: {e}"),
                                     }).await;
@@ -301,27 +332,155 @@ async fn main() -> Result<()> {
                             }
                         }
 
+                        Command::SpeakStart { tts } => {
+                            is_speaking_tts = true;
+                            if let Some(ref mut vad) = vad_engine {
+                                vad.set_threshold(0.85);
+                            }
+                            let _ = event_tx.send(Event::SpeakStarted).await;
+
+                            tts_sample_rate = tts.sample_rate.unwrap_or(16000);
+
+                            // Create fresh streaming output for each speak session
+                            match output::StreamingOutput::new(tts_sample_rate) {
+                                Ok((out, ref_rx)) => {
+                                    streaming_output = Some(out);
+                                    reference_rx = Some(ref_rx);
+                                }
+                                Err(e) => {
+                                    is_speaking_tts = false;
+                                    if let Some(ref mut vad) = vad_engine {
+                                        vad.set_threshold(0.5);
+                                    }
+                                    let _ = event_tx.send(Event::Error {
+                                        message: format!("streaming output init failed: {e}"),
+                                    }).await;
+                                    let _ = event_tx.send(Event::SpeakDone).await;
+                                    continue;
+                                }
+                            }
+
+                            let api_key = match &tts.api_key {
+                                Some(k) => k.clone(),
+                                None => {
+                                    is_speaking_tts = false;
+                                    if let Some(ref mut vad) = vad_engine {
+                                        vad.set_threshold(0.5);
+                                    }
+                                    let _ = event_tx.send(Event::Error {
+                                        message: "TTS requires api_key".to_string(),
+                                    }).await;
+                                    let _ = event_tx.send(Event::SpeakDone).await;
+                                    continue;
+                                }
+                            };
+
+                            let model = tts.model.as_deref().unwrap_or("cosyvoice-v3-flash");
+                            let synth_config = SynthesizerConfig {
+                                api_key,
+                                endpoint: tts.endpoint.clone(),
+                                model: model.to_string(),
+                                voice: tts.voice.clone().unwrap_or_else(|| "longanyang".to_string()),
+                                format: "pcm".to_string(),
+                                sample_rate: tts_sample_rate,
+                                speed: tts.speed,
+                                extra: tts.extra.clone().unwrap_or_default(),
+                            };
+
+                            // Create channel for streaming audio chunks
+                            let (chunk_tx, chunk_rx) = mpsc::channel::<Vec<f32>>(64);
+                            tts_chunk_rx = Some(chunk_rx);
+
+                            match cloud::aliyun::dashscope_tts::DashScopeTtsSession::start(
+                                &synth_config, chunk_tx
+                            ).await {
+                                Ok(session) => {
+                                    tts_session = Some(Box::new(session));
+                                    tracing::info!("TTS session started");
+                                }
+                                Err(e) => {
+                                    is_speaking_tts = false;
+                                    if let Some(ref mut vad) = vad_engine {
+                                        vad.set_threshold(0.5);
+                                    }
+                                    tts_chunk_rx = None;
+                                    let _ = event_tx.send(Event::Error {
+                                        message: format!("TTS session start failed: {e}"),
+                                    }).await;
+                                    let _ = event_tx.send(Event::SpeakDone).await;
+                                }
+                            }
+                        }
+
+                        Command::SpeakChunk { text } => {
+                            tracing::info!(
+                                text_len = text.len(),
+                                text_preview = %text.chars().take(60).collect::<String>(),
+                                "SpeakChunk received"
+                            );
+                            if let Some(ref mut session) = tts_session {
+                                if let Err(e) = session.send_text(&text).await {
+                                    tracing::error!(%e, "TTS session send_text failed");
+                                }
+                            } else {
+                                tracing::warn!("SpeakChunk but no active TTS session");
+                            }
+                        }
+
+                        Command::SpeakEnd => {
+                            tracing::info!("SpeakEnd received");
+                            if let Some(ref mut session) = tts_session {
+                                if let Err(e) = session.finish().await {
+                                    tracing::error!(%e, "TTS session finish failed");
+                                }
+                            }
+                            tts_session = None;
+                            // Don't emit SpeakDone here — Branch 5 will emit it
+                            // when the TTS audio channel closes after all chunks are delivered.
+                        }
+
                         Command::StopSpeaking => {
+                            // Cancel pending drain wait
+                            drain_rx = None;
+                            // Cancel TTS session if active
+                            if let Some(ref mut session) = tts_session {
+                                session.cancel().await;
+                            }
+                            tts_session = None;
+                            // Stop and drop streaming output
+                            if let Some(ref mut out) = streaming_output {
+                                out.stop();
+                            }
+                            streaming_output = None;
+                            reference_rx = None;
+                            // Drop TTS channel to cancel synthesis task
+                            tts_chunk_rx = None;
+                            // Also stop file-based playback if active
                             if let Some(ref mut pb) = playback {
                                 pb.stop();
                             }
                             if is_speaking_tts {
                                 let _ = event_tx.send(Event::SpeakDone).await;
                             }
-                            suppress_stt = false;
                             is_speaking_tts = false;
+                            if let Some(ref mut vad) = vad_engine {
+                                vad.set_threshold(0.5);
+                            }
+                            consecutive_speech_frames = 0;
                             playback_done_rx = None;
+                            // Reset AEC buffers since playback stopped abruptly
+                            if let Some(ref mut ec) = aec_engine {
+                                ec.reset_buffers();
+                            }
                             tracing::info!("speaking stopped");
                         }
 
                         Command::PlayAudio { path } => {
-                            suppress_stt = true;
                             // Init playback lazily (requires audio output device)
                             if playback.is_none() {
                                 match playback::AudioPlayback::new() {
                                     Ok(p) => playback = Some(p),
                                     Err(e) => {
-                                        suppress_stt = false;
                                         let _ = event_tx.send(Event::Error {
                                             message: format!("playback init failed: {e}"),
                                         }).await;
@@ -333,7 +492,6 @@ async fn main() -> Result<()> {
                             match pb.play(std::path::Path::new(&path)) {
                                 Ok(player) => {
                                     tracing::info!(%path, "playback started");
-                                    // Wait for playback completion in a blocking task
                                     let (done_tx, done_rx) = tokio::sync::oneshot::channel();
                                     playback_done_rx = Some(done_rx);
                                     tokio::task::spawn_blocking(move || {
@@ -342,7 +500,6 @@ async fn main() -> Result<()> {
                                     });
                                 }
                                 Err(e) => {
-                                    suppress_stt = false;
                                     let _ = event_tx.send(Event::Error {
                                         message: format!("playback failed: {e}"),
                                     }).await;
@@ -354,7 +511,6 @@ async fn main() -> Result<()> {
                             if let Some(ref mut pb) = playback {
                                 pb.stop();
                             }
-                            suppress_stt = false;
                             playback_done_rx = None;
                             tracing::info!("playback stopped");
                         }
@@ -372,6 +528,14 @@ async fn main() -> Result<()> {
                             if let Some(ref mut pb) = playback {
                                 pb.stop();
                             }
+                            if let Some(ref mut out) = streaming_output {
+                                out.stop();
+                            }
+                            if let Some(ref mut session) = tts_session {
+                                session.cancel().await;
+                            }
+                            tts_session = None;
+                            tts_chunk_rx = None;
                             if let Some(ref mut recognizer) = cloud_recognizer {
                                 let _ = recognizer.stop().await;
                             }
@@ -395,37 +559,87 @@ async fn main() -> Result<()> {
                     None => std::future::pending().await,
                 }
             } => {
-                // Always run VAD (even during playback, for interruption detection)
+                // Drain AEC reference from streaming output.
+                // Always feed render frames — AEC3's delay-agnostic estimator
+                // benefits from continuous render data.
+                if let Some(ref mut ref_rx) = reference_rx {
+                    while let Ok(ref_samples) = ref_rx.try_recv() {
+                        if let Some(ref mut ec) = aec_engine {
+                            let rate = streaming_output.as_ref().map(|o| o.sample_rate()).unwrap_or(16000);
+                            ec.feed_render(&ref_samples, rate);
+                        }
+                    }
+                }
+
+                // Apply AEC to mic audio — produces cleaned signal
+                let cleaned = if let Some(ref mut ec) = aec_engine {
+                    let result = ec.process_capture(&frame, 16000);
+                    if result.is_empty() { frame.clone() } else { result }
+                } else {
+                    frame.clone()
+                };
+
+                // Run VAD on cleaned audio with hybrid gate during TTS playback
                 if let Some(ref mut vad) = vad_engine {
-                    match vad.process(&frame) {
+                    match vad.process(&cleaned) {
                         Ok(transitions) => {
                             for speaking in transitions {
-                                tracing::info!(speaking, "VAD transition");
-                                let _ = event_tx.send(Event::Vad { speaking }).await;
-
-                                if speaking && !was_speaking {
-                                    speech_start_time = Some(Instant::now());
-                                }
-
-                                if !speaking && was_speaking && !suppress_stt {
-                                    if using_cloud_stt {
-                                        // Cloud STT: results come asynchronously via poll_result
-                                        // No action needed on speech end — cloud handles segmentation
+                                if is_speaking_tts {
+                                    // During TTS: require consecutive speech frames for barge-in
+                                    if speaking {
+                                        consecutive_speech_frames += 1;
+                                        if consecutive_speech_frames >= BARGE_IN_FRAME_COUNT && !was_speaking {
+                                            tracing::info!(consecutive_speech_frames, "VAD barge-in triggered");
+                                            let _ = event_tx.send(Event::Vad { speaking: true }).await;
+                                            speech_start_time = Some(Instant::now());
+                                            was_speaking = true;
+                                        }
                                     } else {
-                                        // Local Whisper: offload transcription to blocking task
-                                        if let Some(ref stt) = stt_engine {
-                                            let samples = std::mem::take(&mut speech_buffer);
-                                            let stt = stt.clone();
-                                            let tx = event_tx.clone();
-                                            let base = compute_base_time(speech_start_time.take(), capture_start_time);
-                                            tokio::task::spawn_blocking(move || {
-                                                transcribe_and_emit(&stt, &samples, base, &tx);
-                                            });
+                                        consecutive_speech_frames = 0;
+                                        if was_speaking {
+                                            tracing::info!("VAD speech ended during TTS");
+                                            let _ = event_tx.send(Event::Vad { speaking: false }).await;
+                                            if !using_cloud_stt {
+                                                if let Some(ref stt) = stt_engine {
+                                                    let samples = std::mem::take(&mut speech_buffer);
+                                                    let stt = stt.clone();
+                                                    let tx = event_tx.clone();
+                                                    let base = compute_base_time(speech_start_time.take(), capture_start_time);
+                                                    tokio::task::spawn_blocking(move || {
+                                                        transcribe_and_emit(&stt, &samples, base, &tx);
+                                                    });
+                                                }
+                                            }
+                                            was_speaking = false;
                                         }
                                     }
-                                }
+                                } else {
+                                    // Normal mode: emit VAD transitions immediately
+                                    tracing::info!(speaking, "VAD transition");
+                                    let _ = event_tx.send(Event::Vad { speaking }).await;
 
-                                was_speaking = speaking;
+                                    if speaking && !was_speaking {
+                                        speech_start_time = Some(Instant::now());
+                                    }
+
+                                    if !speaking && was_speaking {
+                                        if using_cloud_stt {
+                                            // Cloud STT handles segmentation
+                                        } else {
+                                            if let Some(ref stt) = stt_engine {
+                                                let samples = std::mem::take(&mut speech_buffer);
+                                                let stt = stt.clone();
+                                                let tx = event_tx.clone();
+                                                let base = compute_base_time(speech_start_time.take(), capture_start_time);
+                                                tokio::task::spawn_blocking(move || {
+                                                    transcribe_and_emit(&stt, &samples, base, &tx);
+                                                });
+                                            }
+                                        }
+                                    }
+
+                                    was_speaking = speaking;
+                                }
                             }
                         }
                         Err(e) => {
@@ -434,18 +648,20 @@ async fn main() -> Result<()> {
                     }
                 }
 
-                // Feed audio to cloud STT (if active and not suppressed)
-                if using_cloud_stt && !suppress_stt {
+                // Feed cleaned audio to cloud STT.
+                // During TTS playback, only feed when hybrid VAD confirms real
+                // speech (barge-in) to avoid transcribing leaked echo.
+                if using_cloud_stt && (!is_speaking_tts || was_speaking) {
                     if let Some(ref mut recognizer) = cloud_recognizer {
-                        if let Err(e) = recognizer.feed_audio(&frame).await {
+                        if let Err(e) = recognizer.feed_audio(&cleaned).await {
                             tracing::error!(%e, "cloud STT feed_audio failed");
                         }
                     }
                 }
 
-                // Accumulate audio for local Whisper STT (only when not suppressed)
-                if !using_cloud_stt && !suppress_stt && was_speaking {
-                    speech_buffer.extend_from_slice(&frame);
+                // Accumulate cleaned audio for local Whisper STT
+                if !using_cloud_stt && was_speaking {
+                    speech_buffer.extend_from_slice(&cleaned);
                 }
             }
 
@@ -456,11 +672,18 @@ async fn main() -> Result<()> {
                         return recognizer.poll_result().await;
                     }
                 }
-                // No cloud STT — pend forever
                 std::future::pending::<Result<Option<cloud::traits::RecognitionResult>>>().await
             } => {
                 match result {
                     Ok(Some(recognition)) => {
+                        // With AEC, no suppression needed — transcripts are clean
+                        tracing::info!(
+                            text = %recognition.text,
+                            is_final = recognition.is_final,
+                            start = recognition.start_time,
+                            end = recognition.end_time,
+                            "cloud STT transcript"
+                        );
                         let _ = event_tx.send(Event::Transcript {
                             text: recognition.text,
                             is_final: recognition.is_final,
@@ -470,7 +693,6 @@ async fn main() -> Result<()> {
                         }).await;
                     }
                     Ok(None) => {
-                        // No result yet — yield briefly to avoid busy-spinning
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                     }
                     Err(e) => {
@@ -479,27 +701,100 @@ async fn main() -> Result<()> {
                 }
             }
 
-            // Branch 4: Playback completion
+            // Branch 4: File-based playback completion (PlayAudio only)
             Ok(()) = async {
                 match playback_done_rx.as_mut() {
                     Some(rx) => rx.await.map_err(|_| ()),
                     None => std::future::pending::<std::result::Result<(), ()>>().await,
                 }
             } => {
-                let was_tts = is_speaking_tts;
-                suppress_stt = false;
-                is_speaking_tts = false;
                 if let Some(ref pb) = playback {
                     pb.set_done();
                 }
                 playback_done_rx = None;
+                let _ = event_tx.send(Event::PlaybackDone).await;
+            }
 
-                if was_tts {
-                    let _ = event_tx.send(Event::SpeakDone).await;
-                } else {
-                    let _ = event_tx.send(Event::PlaybackDone).await;
+            // Branch 5: Drain TTS audio chunks to streaming output
+            result = async {
+                match tts_chunk_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match result {
+                    Some(chunk) => {
+                        if let Some(ref mut out) = streaming_output {
+                            let written = out.write_samples(&chunk, tts_sample_rate);
+                            tracing::debug!(
+                                chunk_samples = chunk.len(),
+                                written,
+                                tts_rate = tts_sample_rate,
+                                device_rate = out.sample_rate(),
+                                "TTS chunk → streaming output"
+                            );
+                        }
+                    }
+                    None => {
+                        // TTS channel closed — all audio chunks delivered.
+                        // Signal finish but keep streaming_output alive so
+                        // the cpal stream can drain the remaining ring buffer.
+                        tracing::info!("TTS audio channel closed, waiting for buffer drain");
+                        tts_chunk_rx = None;
+                        if let Some(ref out) = streaming_output {
+                            out.finish();
+                            // Spawn a polling task to detect when the buffer has drained
+                            let playing = out.playing_flag();
+                            let (tx, rx) = tokio::sync::oneshot::channel();
+                            drain_rx = Some(rx);
+                            tokio::spawn(async move {
+                                loop {
+                                    if !playing.load(std::sync::atomic::Ordering::SeqCst) {
+                                        let _ = tx.send(());
+                                        return;
+                                    }
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                }
+                            });
+                        } else {
+                            // No streaming output — cleanup immediately
+                            if is_speaking_tts {
+                                is_speaking_tts = false;
+                                let _ = event_tx.send(Event::SpeakDone).await;
+                            }
+                            if let Some(ref mut vad) = vad_engine {
+                                vad.set_threshold(0.5);
+                            }
+                            consecutive_speech_frames = 0;
+                        }
+                    }
                 }
             }
+
+            // Branch 6: Streaming output buffer drained — safe to drop and emit SpeakDone
+            Ok(()) = async {
+                match drain_rx.as_mut() {
+                    Some(rx) => rx.await.map_err(|_| ()),
+                    None => std::future::pending::<std::result::Result<(), ()>>().await,
+                }
+            } => {
+                drain_rx = None;
+                tracing::info!("streaming output buffer drained");
+                streaming_output = None;
+                reference_rx = None;
+                if is_speaking_tts {
+                    is_speaking_tts = false;
+                    let _ = event_tx.send(Event::SpeakDone).await;
+                }
+                if let Some(ref mut vad) = vad_engine {
+                    vad.set_threshold(0.5);
+                }
+                consecutive_speech_frames = 0;
+                if let Some(ref mut ec) = aec_engine {
+                    ec.reset_buffers();
+                }
+            }
+
         }
     }
 

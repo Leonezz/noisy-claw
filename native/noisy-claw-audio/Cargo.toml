@@ -28,7 +28,12 @@ tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 futures-util = "0.3"
 async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
-tempfile = "3"
+
+# Echo cancellation
+aec3 = "0.1"
+
+# Ring buffer for streaming output
+ringbuf = "0.4"
 
 # Utilities
 anyhow = "1"

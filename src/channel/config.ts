@@ -1,6 +1,6 @@
 import type { ChannelConfigAdapter } from "openclaw/plugin-sdk";
 import { DEFAULT_VOICE_CONFIG } from "../config/defaults.js";
-import type { VoiceConfig } from "../config/schema.js";
+import { VoiceConfigSchema, type VoiceConfig } from "../config/schema.js";
 
 export type ResolvedVoiceAccount = {
   accountId: string;
@@ -17,7 +17,16 @@ export const voiceConfigAdapter: ChannelConfigAdapter<ResolvedVoiceAccount> = {
     const voiceCfg = (cfg as Record<string, unknown>).channels as
       | Record<string, unknown>
       | undefined;
-    const raw = (voiceCfg?.voice ?? {}) as Partial<VoiceConfig>;
+    const rawInput = voiceCfg?.voice ?? {};
+
+    const parsed = VoiceConfigSchema.safeParse(rawInput);
+    if (!parsed.success) {
+      console.warn(
+        `[noisy-claw] invalid voice config, using defaults: ${parsed.error.message}`,
+      );
+    }
+    const raw: Partial<VoiceConfig> = parsed.success ? parsed.data : {};
+
     return {
       accountId: accountId ?? "default",
       config: {
@@ -40,13 +49,38 @@ export const voiceConfigAdapter: ChannelConfigAdapter<ResolvedVoiceAccount> = {
     return account.config.enabled !== false;
   },
 
-  isConfigured: () => true, // No external service to configure
+  isConfigured: (account) => {
+    const stt = account.config.stt?.provider ?? "whisper";
+    if (stt !== "whisper") {
+      const hasKey = !!(
+        account.config.stt?.apiKey || process.env.DASHSCOPE_API_KEY
+      );
+      if (!hasKey) return false;
+    }
+    return true;
+  },
 
-  describeAccount: (account) => ({
-    accountId: account.accountId,
-    name: "Voice (local mic)",
-    connected: true,
-    configured: true,
-    enabled: account.config.enabled !== false,
-  }),
+  describeAccount: (account) => {
+    const stt = account.config.stt?.provider ?? "whisper";
+    const tts = account.config.tts?.provider;
+    const isCloud = stt !== "whisper" || !!tts;
+    const hasApiKey = !!(
+      account.config.stt?.apiKey ||
+      account.config.tts?.apiKey ||
+      process.env.DASHSCOPE_API_KEY
+    );
+    const configured = !isCloud || hasApiKey;
+
+    const label = isCloud
+      ? `Voice (${stt}${tts ? ` + ${tts} TTS` : ""})`
+      : "Voice (local mic)";
+
+    return {
+      accountId: account.accountId,
+      name: label,
+      connected: configured,
+      configured,
+      enabled: account.config.enabled !== false,
+    };
+  },
 };

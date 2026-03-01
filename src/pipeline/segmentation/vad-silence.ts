@@ -16,7 +16,20 @@ export class VADSilenceSegmentation implements SegmentationEngine {
   }
 
   onTranscript(segment: TranscriptSegment): void {
-    this.segments.push(segment);
+    if (!segment.isFinal) return; // Ignore streaming partials — they get replaced
+
+    // Finalized sentence — emit immediately
+    const text = segment.text.trim();
+    if (!text) return;
+
+    const metadata: SegmentMetadata = {
+      startTime: segment.start,
+      endTime: segment.end,
+      segmentCount: 1,
+    };
+    for (const cb of this.messageCallbacks) {
+      cb(text, metadata);
+    }
   }
 
   onVAD(speaking: boolean): void {
