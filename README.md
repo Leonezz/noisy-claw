@@ -1,5 +1,11 @@
 # Noisy Claw
 
+
+
+https://github.com/user-attachments/assets/777d9c17-a3e3-460f-be79-5ebf01b203b8
+
+
+
 OpenClaw voice channel plugin — bidirectional voice as a first-class channel.
 
 Speak to your agent, hear it respond. Noisy Claw captures audio from your microphone, detects speech with Silero VAD, transcribes it (cloud or local), and delivers the text to the OpenClaw agent. Agent responses are streamed sentence-by-sentence through TTS and played back in real time, with echo cancellation and barge-in support.
