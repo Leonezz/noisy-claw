@@ -4,5 +4,8 @@ native/noisy-claw-audio/target/
 # ML models (downloaded on first use)
 /models/
 
+# Node
+node_modules/
+
 # OS
 .DS_Store
