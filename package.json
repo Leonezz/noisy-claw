@@ -1,0 +1,31 @@
+{
+  "name": "@leonezz/noisy-claw",
+  "version": "0.1.0",
+  "description": "OpenClaw voice channel plugin — bidirectional voice as a first-class channel",
+  "type": "module",
+  "dependencies": {
+    "zod": "^4.3.6"
+  },
+  "peerDependencies": {
+    "openclaw": ">=2026.1.26"
+  },
+  "openclaw": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "channel": {
+      "id": "voice",
+      "label": "Voice",
+      "selectionLabel": "Voice (noisy-claw)",
+      "docsPath": "/channels/voice",
+      "docsLabel": "voice",
+      "blurb": "bidirectional voice channel; speak to your agent, hear it respond.",
+      "order": 80,
+      "quickstartAllowFrom": false
+    },
+    "install": {
+      "npmSpec": "@leonezz/noisy-claw",
+      "defaultChoice": "npm"
+    }
+  }
+}

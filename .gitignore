@@ -1,0 +1,8 @@
+# Rust build output
+native/noisy-claw-audio/target/
+
+# ML models (downloaded on first use)
+/models/
+
+# OS
+.DS_Store

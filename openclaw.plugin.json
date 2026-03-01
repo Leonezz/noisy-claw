@@ -1,0 +1,9 @@
+{
+  "id": "noisy-claw",
+  "channels": ["voice"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}

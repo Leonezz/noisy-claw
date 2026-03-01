@@ -1,0 +1,107 @@
+import { spawn, type ChildProcess } from "node:child_process";
+import { createInterface, type Interface } from "node:readline";
+import { type Command, type AudioEvent, parseEvent, serializeCommand } from "./protocol.js";
+
+export type SubprocessOptions = {
+  binaryPath: string;
+  modelsDir?: string;
+  sttModel?: string;
+  onEvent: (event: AudioEvent) => void;
+  onError: (error: Error) => void;
+  onExit: (code: number | null) => void;
+};
+
+export class AudioSubprocess {
+  private process: ChildProcess | null = null;
+  private readline: Interface | null = null;
+  private readonly options: SubprocessOptions;
+
+  constructor(options: SubprocessOptions) {
+    this.options = options;
+  }
+
+  start(): void {
+    if (this.process) {
+      throw new Error("Subprocess already running");
+    }
+
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      RUST_LOG: "noisy_claw_audio=info",
+    };
+    if (this.options.modelsDir) {
+      env.NOISY_CLAW_MODELS_DIR = this.options.modelsDir;
+    }
+    if (this.options.sttModel) {
+      env.NOISY_CLAW_STT_MODEL = this.options.sttModel;
+    }
+
+    this.process = spawn(this.options.binaryPath, [], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env,
+    });
+
+    // Absorb EPIPE errors on stdin — the subprocess may exit before we finish writing
+    this.process.stdin?.on("error", () => {});
+
+    this.readline = createInterface({ input: this.process.stdout! });
+
+    this.readline.on("line", (line) => {
+      const event = parseEvent(line);
+      if (event) {
+        this.options.onEvent(event);
+      }
+    });
+
+    this.process.stderr?.on("data", (data) => {
+      const msg = data.toString().trim();
+      if (msg) {
+        console.log(`[noisy-claw-audio] ${msg}`);
+      }
+    });
+
+    this.process.on("error", (err) => {
+      this.options.onError(err);
+    });
+
+    this.process.on("exit", (code) => {
+      this.process = null;
+      this.readline = null;
+      this.options.onExit(code);
+    });
+  }
+
+  send(command: Command): void {
+    if (!this.process?.stdin?.writable) {
+      throw new Error("Subprocess not running or stdin not writable");
+    }
+    this.process.stdin.write(serializeCommand(command) + "\n");
+  }
+
+  /** Try to send a command, returning false if the subprocess is gone. */
+  trySend(command: Command): boolean {
+    try {
+      if (!this.process?.stdin?.writable) {
+        return false;
+      }
+      this.process.stdin.write(serializeCommand(command) + "\n");
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  stop(): void {
+    if (this.process) {
+      this.trySend({ cmd: "shutdown" });
+      const killTimer = setTimeout(() => {
+        this.process?.kill("SIGKILL");
+      }, 2000);
+      this.process.on("exit", () => clearTimeout(killTimer));
+    }
+  }
+
+  get isRunning(): boolean {
+    return this.process !== null;
+  }
+}

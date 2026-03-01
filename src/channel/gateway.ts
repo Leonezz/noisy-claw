@@ -1,0 +1,236 @@
+import { existsSync } from "node:fs";
+import type {
+  ChannelGatewayAdapter,
+  ChannelGatewayContext,
+  PluginRuntime,
+} from "openclaw/plugin-sdk";
+import type { AudioEvent } from "../ipc/protocol.js";
+import { AudioSubprocess } from "../ipc/subprocess.js";
+import { resolveModelsDir as resolveFromManager } from "../models/manager.js";
+import { PipelineCoordinator, type PipelineComponents } from "../pipeline/coordinator.js";
+import type { TTSProvider } from "../pipeline/interfaces.js";
+import { RustLocalPlayback } from "../pipeline/output/rust-playback.js";
+import { VADSilenceSegmentation } from "../pipeline/segmentation/vad-silence.js";
+import { RustLocalCapture } from "../pipeline/sources/rust-capture.js";
+import { RustWhisperSTT } from "../pipeline/stt/rust-whisper.js";
+import type { ResolvedVoiceAccount } from "./config.js";
+import { dispatchVoiceTranscript, type VoiceDispatchDeps } from "./dispatch.js";
+import { VoiceSession } from "./session.js";
+
+// Module-level state (accessible to tools and outbound adapter)
+let activePipeline: PipelineCoordinator | null = null;
+let activeSession: VoiceSession | null = null;
+let activeSubprocess: AudioSubprocess | null = null;
+let injectedTtsProvider: TTSProvider | null = null;
+let injectedRuntime: PluginRuntime | null = null;
+let injectedStateDir: string | null = null;
+
+export function getActivePipeline(): PipelineCoordinator | null {
+  return activePipeline;
+}
+
+export function getActiveSession(): VoiceSession | null {
+  return activeSession;
+}
+
+/**
+ * Inject the TTS provider at plugin registration time.
+ * Called from index.ts where the OpenClaw runtime is available.
+ */
+export function setTTSProvider(provider: TTSProvider): void {
+  injectedTtsProvider = provider;
+}
+
+/**
+ * Inject the plugin runtime at registration time.
+ * Required for dispatching voice transcripts to the agent.
+ */
+export function setPluginRuntime(runtime: PluginRuntime): void {
+  injectedRuntime = runtime;
+}
+
+/**
+ * Inject the plugin state directory at service start time.
+ * Used by resolveModelsDir to find downloaded models.
+ */
+export function setStateDir(dir: string): void {
+  injectedStateDir = dir;
+}
+
+export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = {
+  startAccount: async (ctx: ChannelGatewayContext<ResolvedVoiceAccount>) => {
+    const { account, abortSignal } = ctx;
+    const config = account.config;
+
+    const binaryPath = resolveBinaryPath();
+    const modelsDir = resolveModelsDir();
+
+    // Create session
+    const session = new VoiceSession();
+    activeSession = session;
+
+    // Create pipeline components — these need the subprocess reference,
+    // but the subprocess needs references to route events to them.
+    // We create them first, then wire up event routing.
+    let rustCapture: RustLocalCapture;
+    let rustSTT: RustWhisperSTT;
+    let rustPlayback: RustLocalPlayback;
+
+    const subprocess = new AudioSubprocess({
+      binaryPath,
+      modelsDir,
+      onEvent: (event: AudioEvent) => {
+        if (event.event === "vad" || event.event === "transcript") {
+          rustCapture?.handleEvent(event);
+        }
+        if (event.event === "transcript") {
+          rustSTT?.handleEvent(event);
+        }
+        if (event.event === "playback_done") {
+          rustPlayback?.handleEvent(event);
+        }
+        if (event.event === "error") {
+          console.error(
+            `[noisy-claw] audio engine error: ${(event as { message?: string }).message}`,
+          );
+        }
+      },
+      onError: (err) => {
+        console.error("[noisy-claw] subprocess error:", err);
+      },
+      onExit: (code) => {
+        console.log(`[noisy-claw] subprocess exited with code ${code}`);
+        activePipeline = null;
+        activeSubprocess = null;
+      },
+    });
+
+    // Now create the actual pipeline component instances
+    rustCapture = new RustLocalCapture(subprocess);
+    rustSTT = new RustWhisperSTT();
+    rustPlayback = new RustLocalPlayback(subprocess);
+
+    const segmentation = new VADSilenceSegmentation({
+      silenceThresholdMs: config.conversation.endOfTurnSilence,
+    });
+
+    if (!injectedTtsProvider) {
+      console.warn("[noisy-claw] No TTS provider injected — voice responses will be text-only");
+    }
+
+    // Create a no-op TTS fallback if none injected
+    const ttsProvider: TTSProvider = injectedTtsProvider ?? {
+      synthesize: async () => {
+        throw new Error("No TTS provider configured");
+      },
+    };
+
+    const components: PipelineComponents = {
+      audioSource: rustCapture,
+      sttProvider: rustSTT,
+      segmentation,
+      ttsProvider,
+      audioOutput: rustPlayback,
+    };
+
+    const pipeline = new PipelineCoordinator(components);
+    activePipeline = pipeline;
+    activeSubprocess = subprocess;
+
+    // Wire message callback to track segments and dispatch to agent
+    pipeline.onMessage((message, metadata) => {
+      session.update(session.incrementSegments());
+
+      if (!injectedRuntime) {
+        console.warn("[noisy-claw] transcript received but no runtime injected, skipping dispatch");
+        return;
+      }
+
+      const deps: VoiceDispatchDeps = {
+        runtime: injectedRuntime,
+        cfg: ctx.cfg as unknown as Record<string, unknown>,
+        accountId: account.accountId,
+      };
+
+      console.log(
+        `[noisy-claw] dispatching transcript: "${message.slice(0, 80)}${message.length > 80 ? "…" : ""}"`,
+      );
+      void dispatchVoiceTranscript(deps, message, metadata).catch((err) => {
+        console.error("[noisy-claw] failed to dispatch transcript:", err);
+      });
+    });
+
+    // Start the subprocess (begins listening for IPC)
+    subprocess.start();
+
+    // Start the pipeline — begins audio capture and STT
+    pipeline.start({
+      audio: {
+        device: config.audio.device ?? "default",
+        sampleRate: config.audio.sampleRate ?? 16000,
+      },
+      stt: {
+        model: config.stt.model ?? "base",
+        language: config.stt.language ?? "en",
+      },
+    });
+
+    ctx.setStatus({
+      accountId: account.accountId,
+      name: "Voice (active)",
+      connected: true,
+      running: true,
+    });
+
+    // Wait for abort signal — keeps the gateway alive
+    await new Promise<void>((resolve) => {
+      abortSignal.addEventListener(
+        "abort",
+        () => {
+          subprocess.stop();
+          pipeline.stop();
+          activePipeline = null;
+          activeSession = null;
+          activeSubprocess = null;
+          resolve();
+        },
+        { once: true },
+      );
+    });
+  },
+
+  stopAccount: async () => {
+    activeSubprocess?.stop();
+    activePipeline?.stop();
+    activePipeline = null;
+    activeSession = null;
+    activeSubprocess = null;
+  },
+};
+
+function resolveBinaryPath(): string {
+  // In development: cargo build output
+  // In production: bundled binary next to the extension
+  const devPath = new URL(
+    "../../native/noisy-claw-audio/target/release/noisy-claw-audio",
+    import.meta.url,
+  ).pathname;
+
+  return devPath;
+}
+
+function resolveModelsDir(): string {
+  // In dev: check if repo models/ directory exists
+  const devPath = new URL("../../models", import.meta.url).pathname;
+  if (existsSync(devPath)) {
+    return devPath;
+  }
+
+  // Production: use manager's resolution (env var > state dir)
+  if (injectedStateDir) {
+    return resolveFromManager(injectedStateDir);
+  }
+
+  // Fallback to dev path even if it doesn't exist yet
+  return devPath;
+}

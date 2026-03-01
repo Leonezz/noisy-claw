@@ -1,0 +1,72 @@
+import type { PluginRuntime } from "openclaw/plugin-sdk";
+import type { SegmentMetadata } from "../pipeline/interfaces.js";
+
+export type VoiceDispatchDeps = {
+  runtime: PluginRuntime;
+  cfg: Record<string, unknown>;
+  accountId: string;
+};
+
+/**
+ * Dispatch a voice transcript to the OpenClaw agent as an inbound message.
+ * The agent's reply will flow back through the voice outbound adapter.
+ */
+export async function dispatchVoiceTranscript(
+  deps: VoiceDispatchDeps,
+  transcript: string,
+  _metadata: SegmentMetadata,
+): Promise<void> {
+  const { runtime, cfg, accountId } = deps;
+
+  const sessionId = `voice-${accountId}`;
+  const from = `voice:${sessionId}`;
+
+  const route = runtime.channel.routing.resolveAgentRoute({
+    cfg: cfg as Parameters<typeof runtime.channel.routing.resolveAgentRoute>[0]["cfg"],
+    channel: "voice",
+    accountId,
+    peer: { kind: "direct", id: sessionId },
+  });
+
+  const msgCtx = {
+    Body: transcript,
+    BodyForAgent: transcript,
+    RawBody: transcript,
+    CommandBody: transcript,
+    Transcript: transcript,
+    From: from,
+    To: from,
+    SessionKey: route.sessionKey,
+    AccountId: accountId,
+    Provider: "voice",
+    Surface: "voice",
+    OriginatingChannel: "voice" as const,
+    OriginatingTo: from,
+    ChatType: "direct",
+    MessageSid: `voice-${Date.now()}`,
+    Timestamp: Date.now(),
+    CommandAuthorized: true,
+  };
+
+  const finalizedCtx = runtime.channel.reply.finalizeInboundContext(msgCtx);
+
+  await runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher({
+    ctx: finalizedCtx,
+    cfg: cfg as Parameters<
+      typeof runtime.channel.reply.dispatchReplyWithBufferedBlockDispatcher
+    >[0]["cfg"],
+    dispatcherOptions: {
+      deliver: async (payload, _info) => {
+        const text = payload.text?.trim();
+        if (text) {
+          console.log(
+            `[noisy-claw] agent reply: ${text.slice(0, 100)}${text.length > 100 ? "…" : ""}`,
+          );
+        }
+      },
+      onError: (err) => {
+        console.error("[noisy-claw] dispatch error:", err);
+      },
+    },
+  });
+}
