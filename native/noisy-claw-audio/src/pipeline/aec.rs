@@ -64,6 +64,20 @@ pub fn spawn(
     }
 }
 
+/// Compute RMS energy of a signal in dB.
+fn rms_db(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return -100.0;
+    }
+    let sum_sq: f32 = samples.iter().map(|s| s * s).sum();
+    let rms = (sum_sq / samples.len() as f32).sqrt();
+    if rms < 1e-10 {
+        -100.0
+    } else {
+        20.0 * rms.log10()
+    }
+}
+
 async fn aec_loop(
     mut capture_rx: mpsc::UnboundedReceiver<AudioFrame>,
     mut render_rx: mpsc::UnboundedReceiver<AudioFrame>,
@@ -81,6 +95,8 @@ async fn aec_loop(
         }
     };
 
+    let mut log_counter: u32 = 0;
+
     loop {
         tokio::select! {
             Some(ctl) = ctl_rx.recv() => {
@@ -88,7 +104,7 @@ async fn aec_loop(
                     Control::ResetBuffers => {
                         if let Some(ref mut ec) = ec {
                             ec.reset_buffers();
-                            tracing::debug!("AEC node: buffers reset");
+                            tracing::info!("AEC node: buffers reset");
                         }
                     }
                     Control::Shutdown => {
@@ -100,11 +116,15 @@ async fn aec_loop(
 
             // Process capture frames — eagerly drain render reference first
             Some(frame) = capture_rx.recv() => {
+                let mut render_energy = -100.0_f32;
                 if let Some(ref mut ec) = ec {
                     while let Ok(ref_frame) = render_rx.try_recv() {
+                        render_energy = render_energy.max(rms_db(&ref_frame.samples));
                         ec.feed_render(&ref_frame.samples, ref_frame.sample_rate);
                     }
                 }
+
+                let capture_energy = rms_db(&frame.samples);
 
                 let cleaned_samples = if let Some(ref mut ec) = ec {
                     let result = ec.process_capture(&frame.samples, frame.sample_rate);
@@ -112,6 +132,20 @@ async fn aec_loop(
                 } else {
                     frame.samples.clone()
                 };
+
+                let cleaned_energy = rms_db(&cleaned_samples);
+
+                // Log energy levels periodically (~every 500ms at typical frame rates)
+                log_counter += 1;
+                if log_counter % 15 == 0 {
+                    tracing::info!(
+                        capture_db = format!("{:.1}", capture_energy),
+                        render_db = format!("{:.1}", render_energy),
+                        cleaned_db = format!("{:.1}", cleaned_energy),
+                        suppression_db = format!("{:.1}", capture_energy - cleaned_energy),
+                        "AEC node: energy"
+                    );
+                }
 
                 let _ = cleaned_tx.send(AudioFrame {
                     samples: cleaned_samples,

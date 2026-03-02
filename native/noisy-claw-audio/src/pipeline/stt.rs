@@ -1,9 +1,10 @@
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
+use tokio::time::Sleep;
 
 use crate::cloud;
 use crate::cloud::traits::{RecognizerConfig, SpeechRecognizer};
@@ -11,6 +12,9 @@ use crate::protocol::{Event, SttConfig};
 use crate::stt::WhisperSTT;
 
 use super::{AudioFrame, VadEvent};
+
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 pub enum Control {
     StartCloud(SttConfig, u32),
@@ -67,7 +71,7 @@ pub fn spawn(
     mut audio_rx: mpsc::UnboundedReceiver<AudioFrame>,
     mut vad_rx: mpsc::Receiver<VadEvent>,
     event_tx: mpsc::Sender<Event>,
-    is_speaking_tts: watch::Receiver<bool>,
+    _is_speaking_tts: watch::Receiver<bool>,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
@@ -80,56 +84,42 @@ pub fn spawn(
         let mut speech_buffer: Vec<f32> = Vec::new();
         let mut speech_start_time: Option<Instant> = None;
         let mut capture_start_time: Option<Instant> = None;
-        // Pre-roll buffer: keep recent audio so cloud STT gets context
-        // before VAD fires. ~500ms at 16kHz = 8000 samples.
-        let mut preroll_buffer: Vec<f32> = Vec::new();
-        const PREROLL_SAMPLES: usize = 8000;
+
+        // Retry state for cloud reconnection
+        let mut cloud_config: Option<SttConfig> = None;
+        let mut cloud_sample_rate: u32 = 16000;
+        let mut retry_delay = INITIAL_RETRY_DELAY;
+        let mut retry_timer: Option<std::pin::Pin<Box<Sleep>>> = None;
 
         loop {
             tokio::select! {
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
                         Control::StartCloud(stt_config, sample_rate) => {
-                            let provider = stt_config.provider.as_str();
-                            let model = stt_config.model.as_deref()
-                                .unwrap_or("paraformer-realtime-v2");
-                            let api_key = match &stt_config.api_key {
-                                Some(k) => k.clone(),
-                                None => {
-                                    let _ = event_tx.send(Event::Error {
-                                        message: "cloud STT requires api_key".to_string(),
-                                    }).await;
-                                    continue;
-                                }
-                            };
+                            // Store config for reconnection
+                            cloud_config = Some(stt_config.clone());
+                            cloud_sample_rate = sample_rate;
+                            retry_delay = INITIAL_RETRY_DELAY;
+                            retry_timer = None;
 
-                            match cloud::create_recognizer(provider, model) {
-                                Ok(mut recognizer) => {
-                                    let config = RecognizerConfig {
-                                        api_key,
-                                        endpoint: stt_config.endpoint.clone(),
-                                        model: model.to_string(),
-                                        languages: stt_config.languages.clone()
-                                            .unwrap_or_else(|| vec!["en".to_string()]),
-                                        sample_rate,
-                                        extra: stt_config.extra.clone()
-                                            .unwrap_or_default(),
-                                    };
-                                    if let Err(e) = recognizer.start(&config).await {
-                                        let _ = event_tx.send(Event::Error {
-                                            message: format!("cloud STT start failed: {e}"),
-                                        }).await;
-                                        continue;
-                                    }
+                            match try_start_cloud(&stt_config, sample_rate).await {
+                                Ok(recognizer) => {
                                     cloud_recognizer = Some(recognizer);
                                     using_cloud = true;
                                     capture_start_time = Some(Instant::now());
-                                    tracing::info!(provider, model, "STT node: cloud started");
+                                    tracing::info!(
+                                        provider = %stt_config.provider,
+                                        "STT node: cloud started"
+                                    );
                                 }
                                 Err(e) => {
+                                    // Start failed — keep config, schedule retry
+                                    using_cloud = true;
+                                    tracing::error!(%e, "STT node: cloud start failed, will retry");
                                     let _ = event_tx.send(Event::Error {
-                                        message: format!("cloud STT init failed: {e}"),
+                                        message: format!("cloud STT start failed: {e}"),
                                     }).await;
+                                    retry_timer = Some(Box::pin(tokio::time::sleep(retry_delay)));
                                 }
                             }
                         }
@@ -139,6 +129,8 @@ pub fn spawn(
                                 Ok(w) => {
                                     whisper_engine = Some(Arc::new(w));
                                     using_cloud = false;
+                                    cloud_config = None;
+                                    retry_timer = None;
                                     capture_start_time = Some(Instant::now());
                                     tracing::info!("STT node: local Whisper started");
                                 }
@@ -172,10 +164,11 @@ pub fn spawn(
                                 }
                             }
                             cloud_recognizer = None;
+                            cloud_config = None;
                             using_cloud = false;
                             was_speaking = false;
                             speech_buffer.clear();
-                            preroll_buffer.clear();
+                            retry_timer = None;
                             tracing::info!("STT node: stopped");
                         }
 
@@ -189,35 +182,61 @@ pub fn spawn(
                     }
                 }
 
+                // Retry timer fired — attempt reconnection
+                _ = async {
+                    match retry_timer.as_mut() {
+                        Some(timer) => timer.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    retry_timer = None;
+                    if let Some(ref cfg) = cloud_config {
+                        tracing::info!(
+                            delay_secs = retry_delay.as_secs(),
+                            "STT node: attempting cloud reconnection"
+                        );
+                        match try_start_cloud(cfg, cloud_sample_rate).await {
+                            Ok(recognizer) => {
+                                cloud_recognizer = Some(recognizer);
+                                retry_delay = INITIAL_RETRY_DELAY;
+                                capture_start_time = Some(Instant::now());
+                                tracing::info!("STT node: cloud reconnected");
+                            }
+                            Err(e) => {
+                                // Exponential backoff, capped
+                                retry_delay = (retry_delay * 2).min(MAX_RETRY_DELAY);
+                                tracing::warn!(
+                                    %e,
+                                    next_retry_secs = retry_delay.as_secs(),
+                                    "STT node: cloud reconnection failed, scheduling retry"
+                                );
+                                retry_timer = Some(Box::pin(tokio::time::sleep(retry_delay)));
+                            }
+                        }
+                    }
+                }
+
                 // Process audio frames
                 Some(frame) = audio_rx.recv() => {
-                    let speaking_tts = *is_speaking_tts.borrow();
-
+                    // Cloud streaming STT: always feed AEC-cleaned audio.
+                    // AEC removes speaker echo; cloud handles its own VAD.
+                    // No TTS gate — so speech during TTS is captured for
+                    // barge-in transcription instead of being discarded.
                     if using_cloud {
-                        if was_speaking && !speaking_tts {
-                            // Active speech, not during TTS: feed to cloud
-                            if let Some(ref mut recognizer) = cloud_recognizer {
-                                if let Err(e) = recognizer.feed_audio(&frame.samples).await {
-                                    tracing::error!(%e, "STT node: cloud connection lost, dropping recognizer");
-                                    let _ = event_tx.send(Event::Error {
-                                        message: format!("cloud STT disconnected: {e}"),
-                                    }).await;
-                                    // Drop the zombie recognizer to stop error spam
-                                    cloud_recognizer = None;
-                                    using_cloud = false;
-                                }
-                            }
-                        } else {
-                            // Not speaking: maintain pre-roll buffer for speech onset context
-                            preroll_buffer.extend_from_slice(&frame.samples);
-                            if preroll_buffer.len() > PREROLL_SAMPLES {
-                                let drain = preroll_buffer.len() - PREROLL_SAMPLES;
-                                preroll_buffer.drain(..drain);
+                        if let Some(ref mut recognizer) = cloud_recognizer {
+                            if let Err(e) = recognizer.feed_audio(&frame.samples).await {
+                                tracing::error!(%e, "STT node: cloud connection lost");
+                                let _ = event_tx.send(Event::Error {
+                                    message: format!("cloud STT disconnected: {e}"),
+                                }).await;
+                                // Drop zombie, schedule retry
+                                cloud_recognizer = None;
+                                retry_timer = Some(Box::pin(tokio::time::sleep(retry_delay)));
                             }
                         }
                     }
 
-                    // Local Whisper: accumulate during speech
+                    // Local Whisper: accumulate only during speech (VAD-gated)
                     if !using_cloud && was_speaking {
                         speech_buffer.extend_from_slice(&frame.samples);
                     }
@@ -230,20 +249,6 @@ pub fn spawn(
 
                     if vad_event.speaking && !prev_speaking {
                         speech_start_time = Some(Instant::now());
-                        // Flush pre-roll buffer to cloud STT for onset context
-                        if using_cloud && !preroll_buffer.is_empty() {
-                            if let Some(ref mut recognizer) = cloud_recognizer {
-                                let preroll = std::mem::take(&mut preroll_buffer);
-                                if let Err(e) = recognizer.feed_audio(&preroll).await {
-                                    tracing::error!(%e, "STT node: cloud connection lost during preroll");
-                                    let _ = event_tx.send(Event::Error {
-                                        message: format!("cloud STT disconnected: {e}"),
-                                    }).await;
-                                    cloud_recognizer = None;
-                                    using_cloud = false;
-                                }
-                            }
-                        }
                     }
 
                     if !vad_event.speaking && prev_speaking && !using_cloud {
@@ -292,12 +297,11 @@ pub fn spawn(
                         }
                         Err(e) => {
                             tracing::error!(%e, "STT node: cloud poll_result failed");
-                            // Connection is likely dead — clean up
-                            cloud_recognizer = None;
-                            using_cloud = false;
                             let _ = event_tx.send(Event::Error {
                                 message: format!("cloud STT disconnected: {e}"),
                             }).await;
+                            cloud_recognizer = None;
+                            retry_timer = Some(Box::pin(tokio::time::sleep(retry_delay)));
                         }
                     }
                 }
@@ -309,6 +313,38 @@ pub fn spawn(
         control_tx: ctl_tx,
         join,
     }
+}
+
+/// Create and start a cloud recognizer from config.
+async fn try_start_cloud(
+    stt_config: &SttConfig,
+    sample_rate: u32,
+) -> Result<Box<dyn SpeechRecognizer>> {
+    let provider = stt_config.provider.as_str();
+    let model = stt_config
+        .model
+        .as_deref()
+        .unwrap_or("paraformer-realtime-v2");
+    let api_key = stt_config
+        .api_key
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("cloud STT requires api_key"))?
+        .clone();
+
+    let mut recognizer = cloud::create_recognizer(provider, model)?;
+    let config = RecognizerConfig {
+        api_key,
+        endpoint: stt_config.endpoint.clone(),
+        model: model.to_string(),
+        languages: stt_config
+            .languages
+            .clone()
+            .unwrap_or_else(|| vec!["en".to_string()]),
+        sample_rate,
+        extra: stt_config.extra.clone().unwrap_or_default(),
+    };
+    recognizer.start(&config).await?;
+    Ok(recognizer)
 }
 
 fn compute_base_time(speech_start: Option<Instant>, capture_start: Option<Instant>) -> f64 {

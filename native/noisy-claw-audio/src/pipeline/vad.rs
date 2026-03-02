@@ -129,35 +129,46 @@ pub fn spawn(
 
                     // Run VAD inference
                     let Some(ref mut v) = vad else { continue };
-                    let transitions = match v.process(&frame.samples) {
-                        Ok(t) => t,
+                    let results = match v.process(&frame.samples) {
+                        Ok(r) => r,
                         Err(e) => {
                             tracing::error!(%e, "VAD node: processing failed");
                             continue;
                         }
                     };
 
-                    for speaking in transitions {
+                    for w in results {
                         if speaking_tts {
-                            // Periodic debug logging during TTS (every ~30 frames ≈ ~1s)
                             log_counter += 1;
-                            if log_counter % 30 == 0 {
-                                tracing::debug!(
-                                    speaking,
-                                    consecutive_speech_frames,
-                                    was_speaking,
-                                    "VAD node: TTS gate status"
+
+                            // Log every window's probability during TTS (~every 32ms)
+                            // so we can see if AEC is suppressing or threshold is too high.
+                            // Use info level so it shows up with default RUST_LOG.
+                            if log_counter % 15 == 0 {
+                                tracing::info!(
+                                    prob = format!("{:.3}", w.speech_prob),
+                                    is_speech = w.is_speech,
+                                    consecutive = consecutive_speech_frames,
+                                    threshold = v.threshold(),
+                                    "VAD node: TTS gate"
                                 );
                             }
 
                             // Hybrid gate: require sustained speech for barge-in
-                            if speaking {
+                            if w.is_speech {
                                 consecutive_speech_frames += 1;
+                                if consecutive_speech_frames == 1 {
+                                    tracing::info!(
+                                        prob = format!("{:.3}", w.speech_prob),
+                                        "VAD node: speech frame detected during TTS"
+                                    );
+                                }
                                 if consecutive_speech_frames >= BARGE_IN_FRAME_COUNT
                                     && !was_speaking
                                 {
                                     tracing::info!(
                                         consecutive_speech_frames,
+                                        prob = format!("{:.3}", w.speech_prob),
                                         "VAD node: barge-in triggered"
                                     );
                                     let _ = barge_in_tx.send(()).await;
@@ -168,6 +179,13 @@ pub fn spawn(
                                     was_speaking = true;
                                 }
                             } else {
+                                if consecutive_speech_frames > 0 {
+                                    tracing::info!(
+                                        consecutive_speech_frames,
+                                        prob = format!("{:.3}", w.speech_prob),
+                                        "VAD node: speech streak broken during TTS"
+                                    );
+                                }
                                 consecutive_speech_frames = 0;
                                 if was_speaking {
                                     tracing::info!("VAD node: speech ended during TTS");
@@ -181,11 +199,17 @@ pub fn spawn(
                             }
                         } else {
                             log_counter = 0;
-                            // Normal mode: emit transitions immediately
-                            tracing::info!(speaking, "VAD node: transition");
-                            let _ = event_tx.send(Event::Vad { speaking }).await;
-                            let _ = vad_event_tx.send(VadEvent { speaking }).await;
-                            was_speaking = speaking;
+                            // Normal mode: emit on transitions only
+                            if let Some(speaking) = w.transition {
+                                tracing::info!(
+                                    speaking,
+                                    prob = format!("{:.3}", w.speech_prob),
+                                    "VAD node: transition"
+                                );
+                                let _ = event_tx.send(Event::Vad { speaking }).await;
+                                let _ = vad_event_tx.send(VadEvent { speaking }).await;
+                                was_speaking = speaking;
+                            }
                         }
                     }
                 }

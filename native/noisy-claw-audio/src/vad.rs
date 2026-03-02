@@ -9,6 +9,16 @@ const CONTEXT_SIZE: usize = 64; // 4ms context prepended to each window
 const INPUT_SIZE: usize = CONTEXT_SIZE + WINDOW_SIZE; // 576 total
 const SAMPLE_RATE: i64 = 16000;
 
+/// Result of processing one 32ms VAD window.
+pub struct VadWindowResult {
+    /// Raw speech probability from the model (0.0 – 1.0).
+    pub speech_prob: f32,
+    /// Whether the probability crossed the current threshold.
+    pub is_speech: bool,
+    /// State transition: Some(true) = speech started, Some(false) = ended, None = no change.
+    pub transition: Option<bool>,
+}
+
 pub struct VoiceActivityDetector {
     session: Session,
     // Silero VAD v5 uses a single state tensor instead of separate h/c
@@ -74,11 +84,14 @@ impl VoiceActivityDetector {
         Ok(speech_prob)
     }
 
-    /// Process audio samples and return VAD state transitions.
-    /// Returns a vec of booleans: true = speech started, false = speech ended.
-    /// Empty vec means no state change.
-    pub fn process(&mut self, samples: &[f32]) -> Result<Vec<bool>> {
-        let mut transitions = Vec::new();
+    /// Result of processing one VAD window.
+    /// Always contains the speech probability; `transition` is set only on state changes.
+
+    /// Process audio samples and return per-window VAD results.
+    /// Each processed 32ms window produces a VadWindowResult with the raw
+    /// speech probability and an optional state transition.
+    pub fn process(&mut self, samples: &[f32]) -> Result<Vec<VadWindowResult>> {
+        let mut results = Vec::new();
         self.buffer.extend_from_slice(samples);
 
         while self.buffer.len() >= WINDOW_SIZE {
@@ -86,17 +99,29 @@ impl VoiceActivityDetector {
             let speech_prob = self.infer(&window)?;
 
             let is_speech = speech_prob >= self.threshold;
-            if is_speech != self.triggered {
+            let transition = if is_speech != self.triggered {
                 self.triggered = is_speech;
-                transitions.push(is_speech);
-            }
+                Some(is_speech)
+            } else {
+                None
+            };
+
+            results.push(VadWindowResult {
+                speech_prob,
+                is_speech,
+                transition,
+            });
         }
 
-        Ok(transitions)
+        Ok(results)
     }
 
     pub fn set_threshold(&mut self, threshold: f32) {
         self.threshold = threshold;
+    }
+
+    pub fn threshold(&self) -> f32 {
+        self.threshold
     }
 
     pub fn is_speaking(&self) -> bool {
@@ -235,17 +260,24 @@ mod tests {
         // Feed silence first
         let silence = make_silence();
         for _ in 0..5 {
-            let transitions = vad.process(&silence).unwrap();
-            assert!(transitions.is_empty(), "silence should not trigger");
+            let results = vad.process(&silence).unwrap();
+            for r in &results {
+                assert!(r.transition.is_none(), "silence should not trigger");
+            }
         }
 
         // Feed speech — should eventually transition to speaking
         let speech = make_voiced_speech();
         let mut triggered = false;
         for _ in 0..30 {
-            let transitions = vad.process(&speech).unwrap();
-            if transitions.contains(&true) {
-                triggered = true;
+            let results = vad.process(&speech).unwrap();
+            for r in &results {
+                if r.transition == Some(true) {
+                    triggered = true;
+                    break;
+                }
+            }
+            if triggered {
                 break;
             }
         }
