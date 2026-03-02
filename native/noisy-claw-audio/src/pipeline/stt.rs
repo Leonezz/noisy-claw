@@ -72,6 +72,7 @@ pub fn spawn(
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
     let join = tokio::spawn(async move {
+        tracing::info!("STT node: task started");
         let mut cloud_recognizer: Option<Box<dyn SpeechRecognizer>> = None;
         let mut whisper_engine: Option<Arc<WhisperSTT>> = None;
         let mut using_cloud = false;

@@ -71,6 +71,7 @@ pub fn spawn(
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
     let join = tokio::spawn(async move {
+        tracing::info!("TTS node: task started");
         let mut synthesis_handle: Option<JoinHandle<()>> = None;
         let mut tts_session: Option<Box<dyn cloud::traits::TtsSession>> = None;
         // For streaming TTS: task that forwards audio chunks from session → output

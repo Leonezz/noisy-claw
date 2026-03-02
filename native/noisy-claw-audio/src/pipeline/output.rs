@@ -40,6 +40,7 @@ pub fn spawn(
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
     let join = tokio::spawn(async move {
+        tracing::info!("output node: task started");
         let mut streaming_output: Option<StreamingOutput> = None;
         let mut tts_sample_rate: u32 = 16000;
         // Handle for the render-reference forwarding task

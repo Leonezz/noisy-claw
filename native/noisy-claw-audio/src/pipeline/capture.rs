@@ -54,18 +54,20 @@ pub fn spawn(audio_tx: mpsc::UnboundedSender<AudioFrame>) -> Handle {
         let mut capture = AudioCapture::new();
         let mut frame_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>> = None;
         let mut current_sample_rate: u32 = 16000;
+        tracing::info!("capture node: task started");
 
         loop {
             tokio::select! {
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
                         Control::Start { device, sample_rate } => {
+                            tracing::info!(%device, sample_rate, "capture node: starting mic");
                             current_sample_rate = sample_rate;
                             match capture.start(&device, sample_rate) {
                                 Ok(rx) => {
                                     frame_rx = Some(rx);
                                     capturing_flag.store(true, Ordering::SeqCst);
-                                    tracing::info!(%device, sample_rate, "capture node: started");
+                                    tracing::info!(%device, sample_rate, "capture node: mic started successfully");
                                 }
                                 Err(e) => {
                                     tracing::error!(%e, "capture node: start failed");

@@ -68,20 +68,27 @@ pub fn spawn(
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
     let initialized = Arc::new(AtomicBool::new(false));
-    let initialized_flag = initialized.clone();
+
+    // Load model synchronously so is_initialized() is accurate
+    // before any commands arrive.
+    let vad = match VoiceActivityDetector::new(&model_path, initial_threshold) {
+        Ok(v) => {
+            tracing::info!(path = %model_path.display(), "VAD node: model loaded");
+            initialized.store(true, Ordering::SeqCst);
+            Some(v)
+        }
+        Err(e) => {
+            tracing::warn!(
+                %e, path = %model_path.display(),
+                "VAD node: init failed, running in passthrough mode"
+            );
+            None
+        }
+    };
 
     let join = tokio::spawn(async move {
-        let mut vad = match VoiceActivityDetector::new(&model_path, initial_threshold) {
-            Ok(v) => {
-                tracing::info!("VAD node: initialized");
-                initialized_flag.store(true, Ordering::SeqCst);
-                Some(v)
-            }
-            Err(e) => {
-                tracing::warn!(%e, "VAD node: init failed, running in passthrough mode");
-                None
-            }
-        };
+        let mut vad = vad;
+        tracing::info!("VAD node: task started");
 
         let mut consecutive_speech_frames: u32 = 0;
         let mut was_speaking = false;

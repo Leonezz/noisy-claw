@@ -56,8 +56,14 @@ async fn main() -> Result<()> {
     // ── Spawn pipeline nodes ───────────────────────────────────────────
     let models_dir = resolve_models_dir();
 
+    tracing::info!(models_dir = %models_dir.display(), "orchestrator: spawning pipeline nodes");
+
     let capture_handle = pipeline::capture::spawn(capture_tx);
+    tracing::info!("orchestrator: capture node spawned");
+
     let aec_handle = pipeline::aec::spawn(capture_rx, render_ref_rx, cleaned_tx);
+    tracing::info!("orchestrator: AEC node spawned");
+
     let vad_handle = pipeline::vad::spawn(
         cleaned_rx,
         vad_audio_tx,
@@ -67,14 +73,24 @@ async fn main() -> Result<()> {
         models_dir.join("silero_vad.onnx"),
         0.5,
     );
+    tracing::info!(
+        vad_initialized = vad_handle.is_initialized(),
+        "orchestrator: VAD node spawned"
+    );
+
     let stt_handle = pipeline::stt::spawn(
         vad_audio_rx,
         vad_event_rx,
         event_tx.clone(),
         tts_speaking_rx.clone(),
     );
+    tracing::info!("orchestrator: STT node spawned");
+
     let tts_handle = pipeline::tts::spawn(output_msg_tx.clone(), event_tx.clone());
+    tracing::info!("orchestrator: TTS node spawned");
+
     let output_handle = pipeline::output::spawn(output_msg_rx, render_ref_tx, internal_tx);
+    tracing::info!("orchestrator: output node spawned — pipeline ready");
 
     // ── File-based playback (not part of the pipeline) ─────────────────
     let mut playback_engine: Option<playback::AudioPlayback> = None;
@@ -192,6 +208,8 @@ async fn handle_command(
     models_dir: &PathBuf,
     is_speaking_tts: &mut bool,
 ) -> bool {
+    tracing::info!(?cmd, "orchestrator: command received");
+
     match cmd {
         Command::StartCapture {
             device,
@@ -200,6 +218,7 @@ async fn handle_command(
         } => {
             // Check VAD initialization
             if !vad_handle.is_initialized() {
+                tracing::error!("orchestrator: VAD not initialized, rejecting StartCapture");
                 let _ = event_tx.send(Event::Error {
                     message: "VAD init failed: model not available".to_string(),
                 }).await;
@@ -212,25 +231,40 @@ async fn handle_command(
                 .map(|c| c.provider.as_str())
                 .unwrap_or("whisper");
 
+            let stt_provider_str = stt_provider.to_string();
+            tracing::info!(
+                %device, sample_rate, stt_provider = %stt_provider_str,
+                "orchestrator: starting capture pipeline"
+            );
+
             if stt_provider == "whisper" {
                 let stt_filename = std::env::var("NOISY_CLAW_STT_MODEL")
                     .unwrap_or_else(|_| "ggml-base.bin".to_string());
+                tracing::info!(%stt_filename, "orchestrator: starting local Whisper STT");
                 stt_handle
                     .start_local(models_dir.join(&stt_filename), "en".to_string())
                     .await;
             } else if let Some(stt_config) = stt {
+                tracing::info!(stt_provider = %stt_provider_str, "orchestrator: starting cloud STT");
                 stt_handle.start_cloud(stt_config, sample_rate).await;
             }
 
             // Start capture
             capture_handle.start(&device, sample_rate).await;
-            tracing::info!("orchestrator: capture started");
+            tracing::info!(
+                %device, sample_rate,
+                is_capturing = capture_handle.is_capturing(),
+                "orchestrator: capture started"
+            );
         }
 
         Command::StopCapture => {
             capture_handle.stop().await;
             stt_handle.stop().await;
-            tracing::info!("orchestrator: capture stopped");
+            tracing::info!(
+                is_capturing = capture_handle.is_capturing(),
+                "orchestrator: capture stopped"
+            );
         }
 
         Command::Speak { text, tts } => {
