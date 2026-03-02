@@ -151,6 +151,7 @@ impl StreamingOutput {
 
     /// Stop immediately — mark as done. The cpal callback will output silence.
     pub fn stop(&mut self) {
+        self._stream.pause().ok();
         self.finished.store(true, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
     }

@@ -46,7 +46,6 @@ async fn main() -> Result<()> {
 
     // ── Data channels between nodes ────────────────────────────────────
     let (capture_tx, capture_rx) = mpsc::unbounded_channel();     // capture → aec
-    let (raw_capture_tx, raw_capture_rx) = mpsc::unbounded_channel(); // capture → stt (raw, pre-AEC)
     let (render_ref_tx, render_ref_rx) = mpsc::unbounded_channel(); // output → aec
     let (cleaned_tx, cleaned_rx) = mpsc::unbounded_channel();     // aec → vad
     let (vad_audio_tx, vad_audio_rx) = mpsc::unbounded_channel(); // vad → stt (passthrough)
@@ -60,7 +59,7 @@ async fn main() -> Result<()> {
 
     tracing::info!(models_dir = %models_dir.display(), "orchestrator: spawning pipeline nodes");
 
-    let capture_handle = pipeline::capture::spawn(capture_tx, Some(raw_capture_tx));
+    let capture_handle = pipeline::capture::spawn(capture_tx);
     tracing::info!("orchestrator: capture node spawned");
 
     let aec_handle = pipeline::aec::spawn(capture_rx, render_ref_rx, cleaned_tx);
@@ -83,10 +82,8 @@ async fn main() -> Result<()> {
 
     let stt_handle = pipeline::stt::spawn(
         vad_audio_rx,
-        raw_capture_rx,
         vad_event_rx,
         event_tx.clone(),
-        tts_speaking_rx.clone(),
     );
     tracing::info!("orchestrator: STT node spawned");
 

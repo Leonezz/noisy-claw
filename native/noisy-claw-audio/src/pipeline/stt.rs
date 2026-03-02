@@ -1,9 +1,8 @@
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 
@@ -16,11 +15,6 @@ use super::{AudioFrame, VadEvent};
 
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
-
-/// How much raw audio to keep for barge-in pre-roll (~500ms at 16kHz).
-/// Short enough to limit TTS echo contamination, long enough to capture
-/// the speech onset that AEC suppressed during double-talk.
-const RAW_PREROLL_SAMPLES: usize = 8000;
 
 pub enum Control {
     StartCloud(SttConfig, u32),
@@ -72,21 +66,15 @@ impl Handle {
 /// Spawn the STT node.
 ///
 /// Inputs:
-///   - `audio_rx`:      cleaned audio from VadNode (passthrough)
-///   - `raw_audio_rx`:  raw capture audio (pre-AEC) for barge-in pre-roll
-///   - `vad_rx`:        VAD transitions from VadNode
+///   - `audio_rx`:  cleaned audio from VadNode (passthrough)
+///   - `vad_rx`:    VAD transitions from VadNode
 ///
 /// Outputs:
 ///   - `event_tx`:  IPC events (Event::Transcript, Event::Error)
-///
-/// Observes:
-///   - `is_speaking_tts`: gates audio feeding during TTS playback
 pub fn spawn(
     mut audio_rx: mpsc::UnboundedReceiver<AudioFrame>,
-    mut raw_audio_rx: mpsc::UnboundedReceiver<AudioFrame>,
     mut vad_rx: mpsc::Receiver<VadEvent>,
     event_tx: mpsc::Sender<Event>,
-    _is_speaking_tts: watch::Receiver<bool>,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
@@ -105,12 +93,6 @@ pub fn spawn(
         let mut cloud_sample_rate: u32 = 16000;
         let mut retry_delay = INITIAL_RETRY_DELAY;
         let mut retry_timer: Option<std::pin::Pin<Box<Sleep>>> = None;
-
-        // Ring buffer of raw (pre-AEC) audio for barge-in pre-roll.
-        // During barge-in the AEC suppresses user speech (double-talk problem).
-        // We keep raw audio so we can restart the cloud STT session with
-        // unsuppressed speech onset.
-        let mut raw_ring: VecDeque<f32> = VecDeque::with_capacity(RAW_PREROLL_SAMPLES + 4096);
 
         loop {
             tokio::select! {
@@ -190,7 +172,6 @@ pub fn spawn(
                             was_speaking = false;
                             speech_buffer.clear();
                             retry_timer = None;
-                            raw_ring.clear();
                             tracing::info!("STT node: stopped");
                         }
 
@@ -199,31 +180,22 @@ pub fn spawn(
                                 continue;
                             }
                             if let Some(ref cfg) = cloud_config {
-                                // Stop current (confused) session
+                                // Stop current session — it received AEC-suppressed
+                                // audio during double-talk and may be confused.
                                 if let Some(ref mut recognizer) = cloud_recognizer {
                                     let _ = recognizer.stop().await;
                                 }
                                 cloud_recognizer = None;
 
-                                // Collect raw pre-roll audio
-                                let preroll: Vec<f32> = raw_ring.iter().copied().collect();
-                                let preroll_ms = preroll.len() as f64 / cloud_sample_rate as f64 * 1000.0;
-
                                 tracing::info!(
-                                    preroll_samples = preroll.len(),
-                                    preroll_ms = format!("{:.0}", preroll_ms),
-                                    "STT node: barge-in — restarting cloud STT with raw pre-roll"
+                                    "STT node: barge-in — restarting cloud STT (clean)"
                                 );
 
-                                // Start fresh session
+                                // Start a fresh session without pre-roll.
+                                // Raw pre-roll was removed because it contains TTS echo
+                                // which the cloud STT recognizes as phantom speech.
                                 match try_start_cloud(cfg, cloud_sample_rate).await {
-                                    Ok(mut recognizer) => {
-                                        // Feed raw pre-roll (unsuppressed speech onset)
-                                        if !preroll.is_empty() {
-                                            if let Err(e) = recognizer.feed_audio(&preroll).await {
-                                                tracing::error!(%e, "STT node: pre-roll feed failed");
-                                            }
-                                        }
+                                    Ok(recognizer) => {
                                         cloud_recognizer = Some(recognizer);
                                         capture_start_time = Some(Instant::now());
                                         retry_delay = INITIAL_RETRY_DELAY;
@@ -278,15 +250,6 @@ pub fn spawn(
                                 retry_timer = Some(Box::pin(tokio::time::sleep(retry_delay)));
                             }
                         }
-                    }
-                }
-
-                // Accumulate raw (pre-AEC) audio into ring buffer
-                Some(raw_frame) = raw_audio_rx.recv() => {
-                    raw_ring.extend(raw_frame.samples.iter());
-                    // Trim to keep only the most recent samples
-                    while raw_ring.len() > RAW_PREROLL_SAMPLES {
-                        raw_ring.pop_front();
                     }
                 }
 
@@ -488,18 +451,4 @@ mod tests {
         assert_eq!(base, 0.0);
     }
 
-    #[test]
-    fn raw_ring_buffer_capacity() {
-        let mut ring: VecDeque<f32> = VecDeque::with_capacity(RAW_PREROLL_SAMPLES + 4096);
-        // Fill beyond capacity
-        for i in 0..(RAW_PREROLL_SAMPLES + 5000) {
-            ring.push_back(i as f32);
-            while ring.len() > RAW_PREROLL_SAMPLES {
-                ring.pop_front();
-            }
-        }
-        assert_eq!(ring.len(), RAW_PREROLL_SAMPLES);
-        // Most recent sample should be the last one pushed
-        assert_eq!(*ring.back().unwrap(), (RAW_PREROLL_SAMPLES + 4999) as f32);
-    }
 }
