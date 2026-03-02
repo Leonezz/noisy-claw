@@ -9,9 +9,9 @@ use crate::vad::VoiceActivityDetector;
 
 use super::{AudioFrame, VadEvent};
 
-/// ~192ms at 32ms/window — number of consecutive VAD-positive frames
+/// ~128ms at 32ms/window — number of consecutive VAD-positive frames
 /// required before confirming barge-in during TTS playback.
-const BARGE_IN_FRAME_COUNT: u32 = 6;
+const BARGE_IN_FRAME_COUNT: u32 = 4;
 
 pub enum Control {
     SetThreshold(f32),

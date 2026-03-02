@@ -45,7 +45,10 @@ impl Handle {
     }
 }
 
-pub fn spawn(audio_tx: mpsc::UnboundedSender<AudioFrame>) -> Handle {
+pub fn spawn(
+    audio_tx: mpsc::UnboundedSender<AudioFrame>,
+    raw_audio_tx: Option<mpsc::UnboundedSender<AudioFrame>>,
+) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
     let capturing = Arc::new(AtomicBool::new(false));
     let capturing_flag = capturing.clone();
@@ -95,6 +98,13 @@ pub fn spawn(audio_tx: mpsc::UnboundedSender<AudioFrame>) -> Handle {
                         None => std::future::pending().await,
                     }
                 } => {
+                    // Forward raw capture to STT for pre-roll buffer (before AEC)
+                    if let Some(ref tx) = raw_audio_tx {
+                        let _ = tx.send(AudioFrame {
+                            samples: samples.clone(),
+                            sample_rate: current_sample_rate,
+                        });
+                    }
                     let _ = audio_tx.send(AudioFrame {
                         samples,
                         sample_rate: current_sample_rate,
