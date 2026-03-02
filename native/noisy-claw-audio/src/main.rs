@@ -52,6 +52,7 @@ async fn main() -> Result<()> {
     let (vad_event_tx, vad_event_rx) = mpsc::channel(64);        // vad → stt
     let (output_msg_tx, output_msg_rx) = mpsc::channel(64);      // tts → output
     let (internal_tx, mut internal_rx) = mpsc::channel(16);       // output → orchestrator
+    let (barge_in_tx, mut barge_in_rx) = mpsc::channel::<()>(4);  // vad → orchestrator (barge-in)
 
     // ── Spawn pipeline nodes ───────────────────────────────────────────
     let models_dir = resolve_models_dir();
@@ -69,6 +70,7 @@ async fn main() -> Result<()> {
         vad_audio_tx,
         vad_event_tx,
         event_tx.clone(),
+        barge_in_tx,
         tts_speaking_rx.clone(),
         models_dir.join("silero_vad.onnx"),
         0.5,
@@ -160,6 +162,26 @@ async fn main() -> Result<()> {
                 }
                 playback_done_rx = None;
                 let _ = event_tx.send(Event::PlaybackDone).await;
+            }
+
+            // ── VAD barge-in: user interrupted TTS ─────────────────────
+            Some(()) = barge_in_rx.recv() => {
+                if is_speaking_tts {
+                    tracing::info!("orchestrator: barge-in received, stopping TTS");
+                    // Cancel TTS synthesis
+                    tts_handle.stop().await;
+                    // Stop output immediately
+                    let _ = output_msg_tx
+                        .send(pipeline::OutputMessage::StopSession)
+                        .await;
+                    // Reset pipeline state
+                    is_speaking_tts = false;
+                    tts_speaking_tx.send_replace(false);
+                    vad_handle.set_threshold(0.5).await;
+                    vad_handle.reset().await;
+                    aec_handle.reset_buffers().await;
+                    let _ = event_tx.send(Event::SpeakDone).await;
+                }
             }
 
             // ── Output node signals speak done ─────────────────────────

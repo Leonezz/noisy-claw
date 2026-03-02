@@ -114,16 +114,21 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       binaryPath,
       modelsDir,
       onEvent: (event: AudioEvent) => {
-        if (event.event === "vad" || event.event === "transcript") {
+        if (event.event === "vad") {
+          const vadEvent = event as { speaking: boolean };
+          console.log(`[noisy-claw] IPC event: vad speaking=${vadEvent.speaking}`);
           rustCapture?.handleEvent(event);
         }
         if (event.event === "transcript") {
+          rustCapture?.handleEvent(event);
           rustSTT?.handleEvent(event);
         }
         if (event.event === "playback_done" || event.event === "speak_done") {
+          console.log(`[noisy-claw] IPC event: ${event.event}`);
           rustPlayback?.handleEvent(event);
         }
         if (event.event === "speak_started") {
+          console.log("[noisy-claw] IPC event: speak_started");
           session.update(session.setSpeaking(true));
         }
         if (event.event === "speak_done") {

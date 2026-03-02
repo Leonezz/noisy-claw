@@ -53,16 +53,20 @@ export class PipelineCoordinator {
       }
 
       // During echo suppression: detect sustained speech as user interruption
+      console.log(`[noisy-claw] VAD during echo suppression: speaking=${speaking}`);
       if (speaking) {
         if (!interruptTimer) {
+          console.log(`[noisy-claw] barge-in timer started (${INTERRUPT_THRESHOLD_MS}ms)`);
           interruptTimer = setTimeout(() => {
             interruptTimer = null;
+            console.log("[noisy-claw] barge-in confirmed — stopping TTS output");
             audioOutput.stop();
             this.echoSuppressed = false;
           }, INTERRUPT_THRESHOLD_MS);
         }
       } else {
         if (interruptTimer) {
+          console.log("[noisy-claw] barge-in cancelled — speech stopped");
           clearTimeout(interruptTimer);
           interruptTimer = null;
         }
@@ -90,6 +94,7 @@ export class PipelineCoordinator {
 
     // AudioOutput done -> un-suppress STT
     audioOutput.onDone(() => {
+      console.log("[noisy-claw] audioOutput.onDone: echoSuppressed=false");
       this.echoSuppressed = false;
     });
   }
@@ -136,11 +141,13 @@ export class PipelineCoordinator {
   }
 
   async speak(text: string): Promise<void> {
+    console.log("[noisy-claw] pipeline.speak: echoSuppressed=true");
     this.echoSuppressed = true;
     await this.components.audioOutput.speak(text);
   }
 
   speakStart(): void {
+    console.log("[noisy-claw] pipeline.speakStart: echoSuppressed=true");
     this.echoSuppressed = true;
     this.components.audioOutput.speakStart?.();
   }

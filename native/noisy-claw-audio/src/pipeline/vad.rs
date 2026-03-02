@@ -54,6 +54,7 @@ impl Handle {
 ///   - `audio_passthrough_tx`: forwards audio to SttNode
 ///   - `vad_event_tx`:         VAD transitions to SttNode
 ///   - `event_tx`:             IPC events (Event::Vad) to stdout
+///   - `barge_in_tx`:          fires when barge-in is confirmed during TTS
 ///
 /// Observes:
 ///   - `is_speaking_tts`: pipeline-wide TTS state for hybrid gate
@@ -62,6 +63,7 @@ pub fn spawn(
     audio_passthrough_tx: mpsc::UnboundedSender<AudioFrame>,
     vad_event_tx: mpsc::Sender<VadEvent>,
     event_tx: mpsc::Sender<Event>,
+    barge_in_tx: mpsc::Sender<()>,
     is_speaking_tts: watch::Receiver<bool>,
     model_path: PathBuf,
     initial_threshold: f32,
@@ -92,6 +94,7 @@ pub fn spawn(
 
         let mut consecutive_speech_frames: u32 = 0;
         let mut was_speaking = false;
+        let mut log_counter: u32 = 0;
 
         loop {
             tokio::select! {
@@ -100,7 +103,7 @@ pub fn spawn(
                         Control::SetThreshold(t) => {
                             if let Some(ref mut v) = vad {
                                 v.set_threshold(t);
-                                tracing::debug!(threshold = t, "VAD node: threshold updated");
+                                tracing::info!(threshold = t, "VAD node: threshold updated");
                             }
                         }
                         Control::Reset => {
@@ -109,7 +112,7 @@ pub fn spawn(
                             }
                             consecutive_speech_frames = 0;
                             was_speaking = false;
-                            tracing::debug!("VAD node: reset");
+                            tracing::info!("VAD node: reset");
                         }
                         Control::Shutdown => {
                             tracing::info!("VAD node: shutdown");
@@ -136,6 +139,17 @@ pub fn spawn(
 
                     for speaking in transitions {
                         if speaking_tts {
+                            // Periodic debug logging during TTS (every ~30 frames ≈ ~1s)
+                            log_counter += 1;
+                            if log_counter % 30 == 0 {
+                                tracing::debug!(
+                                    speaking,
+                                    consecutive_speech_frames,
+                                    was_speaking,
+                                    "VAD node: TTS gate status"
+                                );
+                            }
+
                             // Hybrid gate: require sustained speech for barge-in
                             if speaking {
                                 consecutive_speech_frames += 1;
@@ -146,6 +160,7 @@ pub fn spawn(
                                         consecutive_speech_frames,
                                         "VAD node: barge-in triggered"
                                     );
+                                    let _ = barge_in_tx.send(()).await;
                                     let _ = event_tx.send(Event::Vad { speaking: true }).await;
                                     let _ = vad_event_tx
                                         .send(VadEvent { speaking: true })
@@ -165,17 +180,11 @@ pub fn spawn(
                                 }
                             }
                         } else {
+                            log_counter = 0;
                             // Normal mode: emit transitions immediately
                             tracing::info!(speaking, "VAD node: transition");
                             let _ = event_tx.send(Event::Vad { speaking }).await;
                             let _ = vad_event_tx.send(VadEvent { speaking }).await;
-
-                            if speaking && !was_speaking {
-                                // speech started
-                            }
-                            if !speaking && was_speaking {
-                                // speech ended
-                            }
                             was_speaking = speaking;
                         }
                     }
