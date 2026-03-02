@@ -80,6 +80,10 @@ pub fn spawn(
         let mut speech_buffer: Vec<f32> = Vec::new();
         let mut speech_start_time: Option<Instant> = None;
         let mut capture_start_time: Option<Instant> = None;
+        // Pre-roll buffer: keep recent audio so cloud STT gets context
+        // before VAD fires. ~500ms at 16kHz = 8000 samples.
+        let mut preroll_buffer: Vec<f32> = Vec::new();
+        const PREROLL_SAMPLES: usize = 8000;
 
         loop {
             tokio::select! {
@@ -171,6 +175,7 @@ pub fn spawn(
                             using_cloud = false;
                             was_speaking = false;
                             speech_buffer.clear();
+                            preroll_buffer.clear();
                             tracing::info!("STT node: stopped");
                         }
 
@@ -188,11 +193,26 @@ pub fn spawn(
                 Some(frame) = audio_rx.recv() => {
                     let speaking_tts = *is_speaking_tts.borrow();
 
-                    // Cloud STT: gate during TTS unless barge-in confirmed
-                    if using_cloud && (!speaking_tts || was_speaking) {
-                        if let Some(ref mut recognizer) = cloud_recognizer {
-                            if let Err(e) = recognizer.feed_audio(&frame.samples).await {
-                                tracing::error!(%e, "STT node: cloud feed_audio failed");
+                    if using_cloud {
+                        if was_speaking && !speaking_tts {
+                            // Active speech, not during TTS: feed to cloud
+                            if let Some(ref mut recognizer) = cloud_recognizer {
+                                if let Err(e) = recognizer.feed_audio(&frame.samples).await {
+                                    tracing::error!(%e, "STT node: cloud connection lost, dropping recognizer");
+                                    let _ = event_tx.send(Event::Error {
+                                        message: format!("cloud STT disconnected: {e}"),
+                                    }).await;
+                                    // Drop the zombie recognizer to stop error spam
+                                    cloud_recognizer = None;
+                                    using_cloud = false;
+                                }
+                            }
+                        } else {
+                            // Not speaking: maintain pre-roll buffer for speech onset context
+                            preroll_buffer.extend_from_slice(&frame.samples);
+                            if preroll_buffer.len() > PREROLL_SAMPLES {
+                                let drain = preroll_buffer.len() - PREROLL_SAMPLES;
+                                preroll_buffer.drain(..drain);
                             }
                         }
                     }
@@ -210,6 +230,20 @@ pub fn spawn(
 
                     if vad_event.speaking && !prev_speaking {
                         speech_start_time = Some(Instant::now());
+                        // Flush pre-roll buffer to cloud STT for onset context
+                        if using_cloud && !preroll_buffer.is_empty() {
+                            if let Some(ref mut recognizer) = cloud_recognizer {
+                                let preroll = std::mem::take(&mut preroll_buffer);
+                                if let Err(e) = recognizer.feed_audio(&preroll).await {
+                                    tracing::error!(%e, "STT node: cloud connection lost during preroll");
+                                    let _ = event_tx.send(Event::Error {
+                                        message: format!("cloud STT disconnected: {e}"),
+                                    }).await;
+                                    cloud_recognizer = None;
+                                    using_cloud = false;
+                                }
+                            }
+                        }
                     }
 
                     if !vad_event.speaking && prev_speaking && !using_cloud {
@@ -258,6 +292,12 @@ pub fn spawn(
                         }
                         Err(e) => {
                             tracing::error!(%e, "STT node: cloud poll_result failed");
+                            // Connection is likely dead — clean up
+                            cloud_recognizer = None;
+                            using_cloud = false;
+                            let _ = event_tx.send(Event::Error {
+                                message: format!("cloud STT disconnected: {e}"),
+                            }).await;
                         }
                     }
                 }
