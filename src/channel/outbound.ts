@@ -10,11 +10,7 @@ export const voiceOutboundAdapter: ChannelOutboundAdapter = {
     // Additionally, synthesize and play audio.
     const pipeline = getActivePipeline();
     if (pipeline) {
-      try {
-        await pipeline.speak(ctx.text);
-      } catch (err) {
-        console.error("[noisy-claw] TTS playback failed:", err);
-      }
+      pipeline.speak(ctx.text);
     }
 
     return {
@@ -28,11 +24,7 @@ export const voiceOutboundAdapter: ChannelOutboundAdapter = {
     if (ctx.text) {
       const pipeline = getActivePipeline();
       if (pipeline) {
-        try {
-          await pipeline.speak(ctx.text);
-        } catch (err) {
-          console.error("[noisy-claw] TTS playback failed:", err);
-        }
+        pipeline.speak(ctx.text);
       }
     }
     return {

@@ -5,19 +5,22 @@ use crate::cloud;
 use crate::cloud::traits::SynthesizerConfig;
 use crate::protocol::{Event, TtsConfig};
 
-use super::OutputMessage;
+use super::{FlushAck, FlushSignal, NodeId, OutputMessage, RequestId};
+use tokio::sync::oneshot;
 
 pub enum Control {
     /// Synthesize full text in batch mode.
-    Speak { text: String, tts_config: TtsConfig },
+    Speak { text: String, tts_config: TtsConfig, request_id: RequestId },
     /// Begin a streaming TTS session.
-    SpeakStart { tts_config: TtsConfig },
+    SpeakStart { tts_config: TtsConfig, request_id: RequestId },
     /// Send a text chunk through the active session.
     SpeakChunk { text: String },
     /// Signal end of streaming text input.
     SpeakEnd,
     /// Cancel active synthesis immediately.
     Stop,
+    /// Flush: cancel active synthesis and reply with FlushAck.
+    Flush { signal: FlushSignal, reply: oneshot::Sender<FlushAck> },
     Shutdown,
 }
 
@@ -27,17 +30,17 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub async fn speak(&self, text: String, tts_config: TtsConfig) {
+    pub async fn speak(&self, text: String, tts_config: TtsConfig, request_id: RequestId) {
         let _ = self
             .control_tx
-            .send(Control::Speak { text, tts_config })
+            .send(Control::Speak { text, tts_config, request_id })
             .await;
     }
 
-    pub async fn speak_start(&self, tts_config: TtsConfig) {
+    pub async fn speak_start(&self, tts_config: TtsConfig, request_id: RequestId) {
         let _ = self
             .control_tx
-            .send(Control::SpeakStart { tts_config })
+            .send(Control::SpeakStart { tts_config, request_id })
             .await;
     }
 
@@ -51,6 +54,12 @@ impl Handle {
 
     pub async fn stop(&self) {
         let _ = self.control_tx.send(Control::Stop).await;
+    }
+
+    pub async fn flush(&self, signal: FlushSignal) -> FlushAck {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.control_tx.send(Control::Flush { signal, reply: tx }).await;
+        rx.await.unwrap_or(FlushAck { node: NodeId::Tts, request_id: None })
     }
 
     pub async fn shutdown(self) {
@@ -76,12 +85,13 @@ pub fn spawn(
         let mut tts_session: Option<Box<dyn cloud::traits::TtsSession>> = None;
         // For streaming TTS: task that forwards audio chunks from session → output
         let mut forwarding_handle: Option<JoinHandle<()>> = None;
+        let mut active_request_id: Option<RequestId> = None;
 
         loop {
             tokio::select! {
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
-                        Control::Speak { text, tts_config } => {
+                        Control::Speak { text, tts_config, request_id } => {
                             // Cancel any previous synthesis
                             cancel_active(
                                 &mut synthesis_handle,
@@ -89,9 +99,11 @@ pub fn spawn(
                                 &mut forwarding_handle,
                             ).await;
 
+                            active_request_id = Some(request_id.clone());
                             let sample_rate = tts_config.sample_rate.unwrap_or(16000);
                             let out_tx = output_tx.clone();
                             let ev_tx = event_tx.clone();
+                            let req_id = request_id.clone();
 
                             let model = tts_config.model.as_deref()
                                 .unwrap_or("cosyvoice-v3-flash").to_string();
@@ -113,7 +125,7 @@ pub fn spawn(
                             synthesis_handle = Some(tokio::spawn(async move {
                                 // Signal output to start a new session
                                 let _ = out_tx.send(
-                                    OutputMessage::StartSession { sample_rate }
+                                    OutputMessage::StartSession { request_id: req_id.clone(), sample_rate }
                                 ).await;
 
                                 match cloud::create_streaming_synthesizer(&provider, &model) {
@@ -122,10 +134,15 @@ pub fn spawn(
                                             mpsc::channel::<Vec<f32>>(64);
 
                                         let out_tx2 = out_tx.clone();
+                                        let req_id_fwd = req_id.clone();
                                         let fwd = tokio::spawn(async move {
                                             while let Some(chunk) = chunk_rx.recv().await {
                                                 let _ = out_tx2.send(
-                                                    OutputMessage::AudioChunk(chunk)
+                                                    OutputMessage::AudioChunk {
+                                                        request_id: req_id_fwd.clone(),
+                                                        samples: chunk,
+                                                        sample_rate,
+                                                    }
                                                 ).await;
                                             }
                                         });
@@ -159,17 +176,18 @@ pub fn spawn(
                                 }
 
                                 // Signal output that all audio has been sent
-                                let _ = out_tx.send(OutputMessage::FinishSession).await;
+                                let _ = out_tx.send(OutputMessage::FinishSession { request_id: req_id }).await;
                             }));
                         }
 
-                        Control::SpeakStart { tts_config } => {
+                        Control::SpeakStart { tts_config, request_id } => {
                             cancel_active(
                                 &mut synthesis_handle,
                                 &mut tts_session,
                                 &mut forwarding_handle,
                             ).await;
 
+                            active_request_id = Some(request_id.clone());
                             let sample_rate = tts_config.sample_rate.unwrap_or(16000);
                             let api_key = match &tts_config.api_key {
                                 Some(k) => k.clone(),
@@ -189,13 +207,14 @@ pub fn spawn(
 
                             // Signal output to start session
                             let _ = output_tx.send(
-                                OutputMessage::StartSession { sample_rate }
+                                OutputMessage::StartSession { request_id: request_id.clone(), sample_rate }
                             ).await;
 
                             // Create channel for audio chunks from session
                             let (chunk_tx, mut chunk_rx) =
                                 mpsc::channel::<Vec<f32>>(64);
 
+                            let req_id_fwd = request_id.clone();
                             match cloud::aliyun::dashscope_tts::DashScopeTtsSession::start(
                                 &synth_config, chunk_tx,
                             ).await {
@@ -208,12 +227,16 @@ pub fn spawn(
                                     forwarding_handle = Some(tokio::spawn(async move {
                                         while let Some(chunk) = chunk_rx.recv().await {
                                             let _ = out_tx.send(
-                                                OutputMessage::AudioChunk(chunk)
+                                                OutputMessage::AudioChunk {
+                                                    request_id: req_id_fwd.clone(),
+                                                    samples: chunk,
+                                                    sample_rate,
+                                                }
                                             ).await;
                                         }
                                         // All chunks forwarded — signal finish
                                         let _ = out_tx.send(
-                                            OutputMessage::FinishSession
+                                            OutputMessage::FinishSession { request_id: req_id_fwd }
                                         ).await;
                                     }));
                                 }
@@ -228,7 +251,7 @@ pub fn spawn(
                                     }).await;
                                     // Clean up: no session, tell output to abort
                                     let _ = output_tx.send(
-                                        OutputMessage::StopSession
+                                        OutputMessage::StopAll
                                     ).await;
                                 }
                             }
@@ -272,7 +295,26 @@ pub fn spawn(
                                 &mut tts_session,
                                 &mut forwarding_handle,
                             ).await;
+                            active_request_id = None;
+                            // Notify output node to stop — aborted synthesis may
+                            // have sent StartSession without a matching FinishSession
+                            let _ = output_tx.send(OutputMessage::StopAll).await;
                             tracing::info!("TTS node: stopped");
+                        }
+
+                        Control::Flush { signal, reply } => {
+                            cancel_active(
+                                &mut synthesis_handle,
+                                &mut tts_session,
+                                &mut forwarding_handle,
+                            ).await;
+                            let req_id = match &signal {
+                                FlushSignal::Flush { request_id } => Some(request_id.clone()),
+                                FlushSignal::FlushAll => None,
+                            };
+                            active_request_id = None;
+                            let _ = reply.send(FlushAck { node: NodeId::Tts, request_id: req_id });
+                            tracing::info!("TTS node: flushed");
                         }
 
                         Control::Shutdown => {
@@ -281,6 +323,7 @@ pub fn spawn(
                                 &mut tts_session,
                                 &mut forwarding_handle,
                             ).await;
+                            active_request_id = None;
                             tracing::info!("TTS node: shutdown");
                             break;
                         }

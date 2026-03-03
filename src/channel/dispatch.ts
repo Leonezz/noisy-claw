@@ -126,7 +126,7 @@ export async function dispatchVoiceTranscript(
   if (streamStarted) {
     const pipeline = deps.getPipeline();
     if (pipeline?.isActive) {
-      await pipeline.speakEnd();
+      pipeline.speakEnd();
     }
   }
 }

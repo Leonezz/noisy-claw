@@ -6,9 +6,13 @@ use tokio::task::JoinHandle;
 
 use crate::output::StreamingOutput;
 
-use super::{AudioFrame, OutputMessage, OutputNodeEvent};
+use super::{AudioFrame, FlushAck, FlushSignal, NodeId, OutputMessage, OutputNodeEvent, RequestId};
+use tokio::sync::oneshot;
 
 pub enum Control {
+    Pause,
+    Resume,
+    Flush { signal: FlushSignal, reply: oneshot::Sender<FlushAck> },
     Shutdown,
 }
 
@@ -18,6 +22,20 @@ pub struct Handle {
 }
 
 impl Handle {
+    pub async fn pause(&self) {
+        let _ = self.control_tx.send(Control::Pause).await;
+    }
+
+    pub async fn resume(&self) {
+        let _ = self.control_tx.send(Control::Resume).await;
+    }
+
+    pub async fn flush(&self, signal: FlushSignal) -> FlushAck {
+        let (tx, rx) = oneshot::channel();
+        let _ = self.control_tx.send(Control::Flush { signal, reply: tx }).await;
+        rx.await.unwrap_or(FlushAck { node: NodeId::Output, request_id: None })
+    }
+
     pub async fn shutdown(self) {
         let _ = self.control_tx.send(Control::Shutdown).await;
         let _ = self.join.await;
@@ -42,7 +60,7 @@ pub fn spawn(
     let join = tokio::spawn(async move {
         tracing::info!("output node: task started");
         let mut streaming_output: Option<StreamingOutput> = None;
-        let mut tts_sample_rate: u32 = 16000;
+        let mut active_request_id: Option<RequestId> = None;
         // Handle for the render-reference forwarding task
         let mut ref_fwd_handle: Option<JoinHandle<()>> = None;
 
@@ -50,6 +68,34 @@ pub fn spawn(
             tokio::select! {
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
+                        Control::Pause => {
+                            if let Some(ref out) = streaming_output {
+                                out.pause();
+                            }
+                            tracing::info!("output node: paused");
+                        }
+                        Control::Resume => {
+                            if let Some(ref out) = streaming_output {
+                                out.resume();
+                            }
+                            tracing::info!("output node: resumed");
+                        }
+                        Control::Flush { signal, reply } => {
+                            if let Some(ref mut out) = streaming_output {
+                                out.stop();
+                            }
+                            streaming_output = None;
+                            if let Some(h) = ref_fwd_handle.take() {
+                                h.abort();
+                            }
+                            let req_id = match &signal {
+                                FlushSignal::Flush { request_id } => Some(request_id.clone()),
+                                FlushSignal::FlushAll => None,
+                            };
+                            active_request_id = None;
+                            let _ = reply.send(FlushAck { node: NodeId::Output, request_id: req_id });
+                            tracing::info!("output node: flushed");
+                        }
                         Control::Shutdown => {
                             if let Some(ref mut out) = streaming_output {
                                 out.stop();
@@ -66,7 +112,7 @@ pub fn spawn(
 
                 Some(msg) = msg_rx.recv() => {
                     match msg {
-                        OutputMessage::StartSession { sample_rate } => {
+                        OutputMessage::StartSession { request_id, sample_rate } => {
                             // Clean up previous session if any
                             if let Some(ref mut out) = streaming_output {
                                 out.stop();
@@ -75,7 +121,7 @@ pub fn spawn(
                                 h.abort();
                             }
 
-                            tts_sample_rate = sample_rate;
+                            active_request_id = Some(request_id);
                             match StreamingOutput::new(sample_rate) {
                                 Ok((out, mut ref_rx)) => {
                                     let output_rate = out.sample_rate();
@@ -107,9 +153,17 @@ pub fn spawn(
                             }
                         }
 
-                        OutputMessage::AudioChunk(samples) => {
+                        OutputMessage::AudioChunk { request_id, samples, sample_rate: chunk_sr } => {
+                            if active_request_id.as_ref() != Some(&request_id) {
+                                tracing::debug!(
+                                    ?request_id,
+                                    ?active_request_id,
+                                    "output node: rejecting stale audio chunk"
+                                );
+                                continue;
+                            }
                             if let Some(ref mut out) = streaming_output {
-                                let written = out.write_samples(&samples, tts_sample_rate);
+                                let written = out.write_samples(&samples, chunk_sr);
                                 tracing::debug!(
                                     chunk_samples = samples.len(),
                                     written,
@@ -118,40 +172,64 @@ pub fn spawn(
                             }
                         }
 
-                        OutputMessage::FinishSession => {
+                        OutputMessage::FinishSession { request_id } => {
+                            if active_request_id.as_ref() != Some(&request_id) {
+                                tracing::debug!(?request_id, "output node: ignoring stale FinishSession");
+                                continue;
+                            }
                             if let Some(ref out) = streaming_output {
                                 out.finish();
 
-                                // Poll until buffer drains
+                                // Spawn a non-blocking drain watcher so the select
+                                // loop stays responsive to Flush/Shutdown controls
                                 let playing = out.playing_flag();
-                                loop {
-                                    if !playing.load(Ordering::SeqCst) {
-                                        break;
+                                let drain_tx = internal_tx.clone();
+                                tokio::spawn(async move {
+                                    while playing.load(Ordering::SeqCst) {
+                                        tokio::time::sleep(Duration::from_millis(50)).await;
                                     }
-                                    tokio::time::sleep(Duration::from_millis(50)).await;
-                                }
-
-                                tracing::info!("output node: buffer drained");
+                                    tracing::info!("output node: buffer drained");
+                                    let _ = drain_tx.send(OutputNodeEvent::SpeakDone).await;
+                                });
+                            } else {
+                                let _ = internal_tx.send(OutputNodeEvent::SpeakDone).await;
                             }
 
-                            // Clean up
-                            streaming_output = None;
-                            if let Some(h) = ref_fwd_handle.take() {
-                                h.abort();
-                            }
-
-                            let _ = internal_tx.send(OutputNodeEvent::SpeakDone).await;
+                            // Clean up — keep streaming_output alive for the drain
+                            // watcher to read the playing flag; Flush/StopAll will
+                            // clear it immediately if a barge-in occurs.
+                            active_request_id = None;
+                            // Note: streaming_output and ref_fwd_handle are NOT
+                            // cleaned up here — they will be cleaned up by the next
+                            // StartSession, Flush, StopAll, or Shutdown handler.
                         }
 
-                        OutputMessage::StopSession => {
+                        OutputMessage::StopSession { request_id } => {
+                            if active_request_id.as_ref() != Some(&request_id) {
+                                tracing::debug!(?request_id, "output node: ignoring stale StopSession");
+                                continue;
+                            }
                             if let Some(ref mut out) = streaming_output {
                                 out.stop();
                             }
                             streaming_output = None;
+                            active_request_id = None;
                             if let Some(h) = ref_fwd_handle.take() {
                                 h.abort();
                             }
                             tracing::info!("output node: session stopped (interrupted)");
+                        }
+
+                        OutputMessage::StopAll => {
+                            if let Some(ref mut out) = streaming_output {
+                                out.stop();
+                            }
+                            streaming_output = None;
+                            active_request_id = None;
+                            if let Some(h) = ref_fwd_handle.take() {
+                                h.abort();
+                            }
+                            tracing::info!("output node: all sessions stopped");
                         }
                     }
                 }

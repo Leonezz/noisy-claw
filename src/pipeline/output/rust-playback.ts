@@ -4,9 +4,8 @@ import type { AudioOutput } from "../interfaces.js";
 
 export class RustLocalPlayback implements AudioOutput {
   private playing = false;
-  private doneCallbacks: Array<() => void> = [];
-  private playResolve: (() => void) | null = null;
-  private speakEndResolve: (() => void) | null = null;
+  private doneCallbacks: Array<(requestId: string, reason: string) => void> = [];
+  private activeRequestId: string | null = null;
   private ttsConfig: TtsConfig | null = null;
 
   constructor(private readonly subprocess: AudioSubprocess) {}
@@ -15,85 +14,71 @@ export class RustLocalPlayback implements AudioOutput {
     this.ttsConfig = config;
   }
 
-  speak(text: string): Promise<void> {
-    if (!this.ttsConfig) {
-      return Promise.reject(new Error("No TTS config set"));
-    }
-    return new Promise<void>((resolve) => {
-      this.playing = true;
-      this.playResolve = resolve;
-      this.subprocess.speak(text, this.ttsConfig!);
+  speak(text: string, requestId: string): void {
+    if (!this.ttsConfig) throw new Error("No TTS config set");
+    this.playing = true;
+    this.activeRequestId = requestId;
+    this.subprocess.trySend({
+      cmd: "speak",
+      text,
+      tts: this.ttsConfig,
+      request_id: requestId,
     });
   }
 
-  play(audioPath: string): Promise<void> {
-    return new Promise<void>((resolve) => {
-      this.playing = true;
-      this.playResolve = resolve;
-      if (!this.subprocess.trySend({ cmd: "play_audio", path: audioPath })) {
-        this.playing = false;
-        this.playResolve = null;
-        resolve();
-      }
+  speakStart(requestId: string): void {
+    if (!this.ttsConfig) throw new Error("No TTS config set");
+    this.playing = true;
+    this.activeRequestId = requestId;
+    this.subprocess.trySend({
+      cmd: "speak_start",
+      tts: this.ttsConfig,
+      request_id: requestId,
     });
+  }
+
+  speakChunk(text: string, _requestId: string): void {
+    this.subprocess.trySend({
+      cmd: "speak_chunk",
+      text,
+    });
+  }
+
+  speakEnd(_requestId: string): void {
+    this.subprocess.trySend({ cmd: "speak_end" });
   }
 
   stop(): void {
-    // stop_speaking handles both streaming TTS and file-based playback
     this.subprocess.trySend({ cmd: "stop_speaking" });
     this.playing = false;
-    if (this.playResolve) {
-      this.playResolve();
-      this.playResolve = null;
-    }
-    if (this.speakEndResolve) {
-      this.speakEndResolve();
-      this.speakEndResolve = null;
-    }
+    this.activeRequestId = null;
+  }
+
+  flush(requestId: string): void {
+    this.subprocess.trySend({ cmd: "flush_speak", request_id: requestId });
   }
 
   isPlaying(): boolean {
     return this.playing;
   }
 
-  onDone(cb: () => void): void {
+  onDone(cb: (requestId: string, reason: string) => void): void {
     this.doneCallbacks.push(cb);
   }
 
-  speakStart(): void {
-    if (!this.ttsConfig) {
-      throw new Error("No TTS config set");
-    }
-    this.playing = true;
-    this.subprocess.speakStart(this.ttsConfig);
-  }
-
-  speakChunk(text: string): void {
-    this.subprocess.speakChunk(text);
-  }
-
-  speakEnd(): Promise<void> {
-    return new Promise<void>((resolve) => {
-      this.speakEndResolve = resolve;
-      this.subprocess.speakEnd();
-    });
-  }
-
-  /** Called by the coordinator when IPC events arrive. */
+  /** Called by the gateway when IPC events arrive. */
   handleEvent(event: AudioEvent): void {
-    if (event.event === "playback_done" || event.event === "speak_done") {
+    if (event.event === "speak_done") {
       this.playing = false;
-      if (this.playResolve) {
-        this.playResolve();
-        this.playResolve = null;
-      }
-      if (this.speakEndResolve) {
-        this.speakEndResolve();
-        this.speakEndResolve = null;
-      }
+      const reqId = event.request_id ?? this.activeRequestId ?? "";
+      const reason = event.reason;
+      this.activeRequestId = null;
       for (const cb of this.doneCallbacks) {
-        cb();
+        cb(reqId, reason);
       }
+    }
+    if (event.event === "playback_done") {
+      this.playing = false;
     }
   }
 }

@@ -16,6 +16,7 @@ pub struct StreamingOutput {
     producer: ringbuf::HeapProd<f32>,
     playing: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     /// The actual device output sample rate (may differ from requested TTS rate).
     native_rate: u32,
 }
@@ -72,8 +73,10 @@ impl StreamingOutput {
 
         let playing = Arc::new(AtomicBool::new(true));
         let finished = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let playing_cb = playing.clone();
         let finished_cb = finished.clone();
+        let paused_cb = paused.clone();
 
         let (ref_tx, ref_rx) = mpsc::unbounded_channel::<Vec<f32>>();
         let ch = channels as usize;
@@ -83,18 +86,25 @@ impl StreamingOutput {
             move |data: &mut [f32], _info| {
                 let frame_count = data.len() / ch;
                 let mut mono_ref = Vec::with_capacity(frame_count);
+                let is_paused = paused_cb.load(Ordering::SeqCst);
 
                 for frame_idx in 0..frame_count {
-                    let sample = consumer.try_pop().unwrap_or(0.0);
+                    // When paused, output silence without consuming the ring buffer
+                    let sample = if is_paused {
+                        0.0
+                    } else {
+                        consumer.try_pop().unwrap_or(0.0)
+                    };
                     mono_ref.push(sample);
                     for c in 0..ch {
                         data[frame_idx * ch + c] = sample;
                     }
                 }
 
+                // Send reference (silence during pause) to AEC
                 let _ = ref_tx.send(mono_ref);
 
-                if finished_cb.load(Ordering::SeqCst) && consumer.is_empty() {
+                if !is_paused && finished_cb.load(Ordering::SeqCst) && consumer.is_empty() {
                     playing_cb.store(false, Ordering::SeqCst);
                 }
             },
@@ -119,6 +129,7 @@ impl StreamingOutput {
                 producer,
                 playing,
                 finished,
+                paused,
                 native_rate,
             },
             ref_rx,
@@ -154,6 +165,18 @@ impl StreamingOutput {
         self._stream.pause().ok();
         self.finished.store(true, Ordering::SeqCst);
         self.playing.store(false, Ordering::SeqCst);
+        self.paused.store(false, Ordering::SeqCst);
+    }
+
+    /// Pause playback — cpal callback outputs silence but ring buffer is preserved.
+    /// Used during barge-in evaluation (pause-then-evaluate pattern).
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::SeqCst);
+    }
+
+    /// Resume playback from where it was paused.
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::SeqCst);
     }
 
     pub fn is_playing(&self) -> bool {

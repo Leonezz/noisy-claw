@@ -42,7 +42,7 @@ export function createVoiceSpeakTool(deps: VoiceSpeakDeps) {
         };
       }
 
-      await pipeline.speak(textToSpeak);
+      pipeline.speak(textToSpeak);
 
       return {
         content: [

@@ -11,18 +11,17 @@ import type {
 } from "./interfaces.js";
 
 function createMockComponents(): PipelineComponents & {
-  // Expose internals for test assertions
   _audioVadCbs: Array<(speaking: boolean) => void>;
   _audioChunkCbs: Array<(chunk: AudioChunk) => void>;
   _sttTranscriptCbs: Array<(segment: TranscriptSegment) => void>;
   _segMessageCbs: Array<(msg: string, meta: SegmentMetadata) => void>;
-  _outputDoneCbs: Array<() => void>;
+  _outputDoneCbs: Array<(requestId: string, reason: string) => void>;
 } {
   const audioVadCbs: Array<(speaking: boolean) => void> = [];
   const audioChunkCbs: Array<(chunk: AudioChunk) => void> = [];
   const sttTranscriptCbs: Array<(segment: TranscriptSegment) => void> = [];
   const segMessageCbs: Array<(msg: string, meta: SegmentMetadata) => void> = [];
-  const outputDoneCbs: Array<() => void> = [];
+  const outputDoneCbs: Array<(requestId: string, reason: string) => void> = [];
 
   const audioSource: AudioSource = {
     start: vi.fn(),
@@ -46,9 +45,12 @@ function createMockComponents(): PipelineComponents & {
   };
 
   const audioOutput: AudioOutput = {
-    play: vi.fn(async () => {}),
-    speak: vi.fn(async () => {}),
+    speak: vi.fn(),
+    speakStart: vi.fn(),
+    speakChunk: vi.fn(),
+    speakEnd: vi.fn(),
     stop: vi.fn(),
+    flush: vi.fn(),
     isPlaying: vi.fn(() => false),
     onDone: (cb) => outputDoneCbs.push(cb),
   };
@@ -121,7 +123,7 @@ describe("PipelineCoordinator", () => {
     expect(mocks.segmentation.onVAD).toHaveBeenCalledWith(true);
   });
 
-  it("forwards audio chunks to STT when not suppressed", () => {
+  it("forwards audio chunks to STT", () => {
     const chunk: AudioChunk = {
       data: Buffer.from([]),
       timestamp: 0,
@@ -161,70 +163,52 @@ describe("PipelineCoordinator", () => {
     expect(messageCb).toHaveBeenCalledWith("hello world", metadata);
   });
 
-  it("speak() delegates to audioOutput.speak() with echo suppression", async () => {
-    await coordinator.speak("test message");
+  it("speak() delegates to audioOutput.speak() with requestId", () => {
+    coordinator.speak("test message");
 
-    expect(mocks.audioOutput.speak).toHaveBeenCalledWith("test message");
+    expect(mocks.audioOutput.speak).toHaveBeenCalledWith(
+      "test message",
+      expect.stringMatching(/^req-ts-/),
+    );
   });
 
-  it("VAD events suppressed during echo suppression", async () => {
-    // Start speaking (triggers echo suppression)
-    await coordinator.speak("response");
+  it("speakStart/speakChunk/speakEnd flow with sentence chunking", () => {
+    coordinator.speakStart();
+    expect(mocks.audioOutput.speakStart).toHaveBeenCalledWith(
+      expect.stringMatching(/^req-ts-/),
+    );
 
-    // Brief VAD during playback — should NOT forward to segmentation
-    for (const cb of mocks._audioVadCbs) {
-      cb(true);
-    }
+    // Send partial text (no sentence boundary yet)
+    coordinator.speakChunk("Hello wor");
+    expect(mocks.audioOutput.speakChunk).not.toHaveBeenCalled();
 
-    expect(mocks.segmentation.onVAD).not.toHaveBeenCalled();
+    // Complete the sentence with boundary
+    coordinator.speakChunk("ld. How ");
+    expect(mocks.audioOutput.speakChunk).toHaveBeenCalledTimes(1);
+    expect(mocks.audioOutput.speakChunk).toHaveBeenCalledWith(
+      "Hello world.",
+      expect.stringMatching(/^req-ts-/),
+    );
+
+    // speakEnd flushes remaining buffer (includes leading space from split)
+    coordinator.speakEnd();
+    expect(mocks.audioOutput.speakChunk).toHaveBeenCalledTimes(2);
+    expect(mocks.audioOutput.speakChunk).toHaveBeenLastCalledWith(
+      " How ",
+      expect.stringMatching(/^req-ts-/),
+    );
+    expect(mocks.audioOutput.speakEnd).toHaveBeenCalled();
   });
 
-  it("sustained VAD during echo suppression triggers interruption", async () => {
-    vi.useFakeTimers();
-    await coordinator.speak("response");
+  it("onDone callback resets activeRequestId", () => {
+    coordinator.speak("response");
 
-    // VAD starts — no immediate interruption
-    for (const cb of mocks._audioVadCbs) {
-      cb(true);
-    }
-    expect(mocks.audioOutput.stop).not.toHaveBeenCalled();
-
-    // After 50ms confirmation window → interruption
-    // (Rust hybrid VAD already requires ~192ms sustained speech before emitting)
-    vi.advanceTimersByTime(50);
-    expect(mocks.audioOutput.stop).toHaveBeenCalled();
-
-    vi.useRealTimers();
-  });
-
-  it("interrupted VAD during echo suppression does not trigger interruption", async () => {
-    vi.useFakeTimers();
-    await coordinator.speak("response");
-
-    // VAD on for 20ms, then off (brief noise — below 50ms threshold)
-    for (const cb of mocks._audioVadCbs) {
-      cb(true);
-    }
-    vi.advanceTimersByTime(20);
-    for (const cb of mocks._audioVadCbs) {
-      cb(false);
-    }
-    vi.advanceTimersByTime(100);
-
-    expect(mocks.audioOutput.stop).not.toHaveBeenCalled();
-
-    vi.useRealTimers();
-  });
-
-  it("echo suppression clears when playback finishes", async () => {
-    await coordinator.speak("response");
-
-    // Playback finishes
+    // Simulate done
     for (const cb of mocks._outputDoneCbs) {
-      cb();
+      cb("req-ts-000001", "completed");
     }
 
-    // Audio chunks should now flow to STT again
+    // Audio chunks should still flow to STT (no echo suppression in TS anymore)
     const chunk: AudioChunk = { data: Buffer.from([]), timestamp: 0 };
     for (const cb of mocks._audioChunkCbs) {
       cb(chunk);

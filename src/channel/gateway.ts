@@ -115,8 +115,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       modelsDir,
       onEvent: (event: AudioEvent) => {
         if (event.event === "vad") {
-          const vadEvent = event as { speaking: boolean };
-          console.log(`[noisy-claw] IPC event: vad speaking=${vadEvent.speaking}`);
+          console.log(`[noisy-claw] IPC event: vad speaking=${event.speaking}`);
           rustCapture?.handleEvent(event);
         }
         if (event.event === "transcript") {
@@ -135,9 +134,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
           session.update(session.setSpeaking(false));
         }
         if (event.event === "error") {
-          console.error(
-            `[noisy-claw] audio engine error: ${(event as { message?: string }).message}`,
-          );
+          console.error(`[noisy-claw] audio engine error: ${event.message}`);
         }
       },
       onError: (err) => {

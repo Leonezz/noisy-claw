@@ -11,7 +11,7 @@ use crate::cloud::traits::{RecognizerConfig, SpeechRecognizer};
 use crate::protocol::{Event, SttConfig};
 use crate::stt::WhisperSTT;
 
-use super::{AudioFrame, VadEvent};
+use super::{AudioFrame, TranscriptEvent, VadEvent};
 
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -20,9 +20,6 @@ pub enum Control {
     StartCloud(SttConfig, u32),
     StartLocal { model_path: std::path::PathBuf, language: String },
     Stop,
-    /// Barge-in occurred: restart cloud STT with raw audio pre-roll
-    /// so the speech onset (suppressed by AEC during TTS) is preserved.
-    BargeIn,
     Shutdown,
 }
 
@@ -53,10 +50,6 @@ impl Handle {
         let _ = self.control_tx.send(Control::Stop).await;
     }
 
-    pub async fn barge_in(&self) {
-        let _ = self.control_tx.send(Control::BargeIn).await;
-    }
-
     pub async fn shutdown(self) {
         let _ = self.control_tx.send(Control::Shutdown).await;
         let _ = self.join.await;
@@ -75,6 +68,7 @@ pub fn spawn(
     mut audio_rx: mpsc::UnboundedReceiver<AudioFrame>,
     mut vad_rx: mpsc::Receiver<VadEvent>,
     event_tx: mpsc::Sender<Event>,
+    transcript_notify_tx: mpsc::Sender<TranscriptEvent>,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
@@ -175,40 +169,6 @@ pub fn spawn(
                             tracing::info!("STT node: stopped");
                         }
 
-                        Control::BargeIn => {
-                            if !using_cloud {
-                                continue;
-                            }
-                            if let Some(ref cfg) = cloud_config {
-                                // Stop current session — it received AEC-suppressed
-                                // audio during double-talk and may be confused.
-                                if let Some(ref mut recognizer) = cloud_recognizer {
-                                    let _ = recognizer.stop().await;
-                                }
-                                cloud_recognizer = None;
-
-                                tracing::info!(
-                                    "STT node: barge-in — restarting cloud STT (clean)"
-                                );
-
-                                // Start a fresh session without pre-roll.
-                                // Raw pre-roll was removed because it contains TTS echo
-                                // which the cloud STT recognizes as phantom speech.
-                                match try_start_cloud(cfg, cloud_sample_rate).await {
-                                    Ok(recognizer) => {
-                                        cloud_recognizer = Some(recognizer);
-                                        capture_start_time = Some(Instant::now());
-                                        retry_delay = INITIAL_RETRY_DELAY;
-                                        tracing::info!("STT node: cloud restarted after barge-in");
-                                    }
-                                    Err(e) => {
-                                        tracing::error!(%e, "STT node: cloud restart after barge-in failed");
-                                        retry_timer = Some(Box::pin(tokio::time::sleep(retry_delay)));
-                                    }
-                                }
-                            }
-                        }
-
                         Control::Shutdown => {
                             if let Some(ref mut recognizer) = cloud_recognizer {
                                 let _ = recognizer.stop().await;
@@ -255,10 +215,9 @@ pub fn spawn(
 
                 // Process AEC-cleaned audio frames
                 Some(frame) = audio_rx.recv() => {
-                    // Cloud streaming STT: always feed AEC-cleaned audio.
-                    // AEC removes speaker echo; cloud handles its own VAD.
-                    // No TTS gate — so speech during TTS is captured for
-                    // barge-in transcription instead of being discarded.
+                    // Cloud streaming STT: feed AEC-cleaned audio.
+                    // Audio is gated at the VAD layer — during TTS playback,
+                    // only speech confirmed by barge-in detection is forwarded.
                     if using_cloud {
                         if let Some(ref mut recognizer) = cloud_recognizer {
                             if let Err(e) = recognizer.feed_audio(&frame.samples).await {
@@ -321,6 +280,14 @@ pub fn spawn(
                                 is_final = recognition.is_final,
                                 "STT node: transcript"
                             );
+                            // Notify orchestrator (non-blocking) for barge-in evaluation
+                            let _ = transcript_notify_tx.try_send(TranscriptEvent {
+                                text: recognition.text.clone(),
+                                is_final: recognition.is_final,
+                                start: recognition.start_time,
+                                end: recognition.end_time,
+                                confidence: recognition.confidence,
+                            });
                             let _ = event_tx.send(Event::Transcript {
                                 text: recognition.text,
                                 is_final: recognition.is_final,

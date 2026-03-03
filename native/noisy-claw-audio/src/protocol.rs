@@ -38,15 +38,22 @@ pub enum Command {
     Speak {
         text: String,
         tts: TtsConfig,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     SpeakStart {
         tts: TtsConfig,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     SpeakChunk {
         text: String,
     },
     SpeakEnd,
     StopSpeaking,
+    FlushSpeak {
+        request_id: String,
+    },
     PlayAudio {
         path: String,
     },
@@ -78,8 +85,15 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
     },
-    SpeakStarted,
-    SpeakDone,
+    SpeakStarted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    SpeakDone {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        reason: String,
+    },
     PlaybackDone,
     Status {
         capturing: bool,
@@ -146,11 +160,12 @@ mod tests {
         let json = r#"{"cmd":"speak","text":"hello","tts":{"provider":"aliyun","model":"cosyvoice-v3-flash","voice":"longanyang"}}"#;
         let cmd: Command = serde_json::from_str(json).unwrap();
         match cmd {
-            Command::Speak { text, tts } => {
+            Command::Speak { text, tts, request_id } => {
                 assert_eq!(text, "hello");
                 assert_eq!(tts.provider, "aliyun");
                 assert_eq!(tts.model.unwrap(), "cosyvoice-v3-flash");
                 assert_eq!(tts.voice.unwrap(), "longanyang");
+                assert!(request_id.is_none());
             }
             _ => panic!("expected Speak"),
         }
@@ -264,16 +279,42 @@ mod tests {
 
     #[test]
     fn serialize_speak_started() {
-        let json = serde_json::to_string(&Event::SpeakStarted).unwrap();
+        let json = serde_json::to_string(&Event::SpeakStarted { request_id: Some("req-001".to_string()) }).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["event"], "speak_started");
+        assert_eq!(v["request_id"], "req-001");
+    }
+
+    #[test]
+    fn serialize_speak_started_without_request_id() {
+        let json = serde_json::to_string(&Event::SpeakStarted { request_id: None }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "speak_started");
+        assert!(v.get("request_id").is_none());
     }
 
     #[test]
     fn serialize_speak_done() {
-        let json = serde_json::to_string(&Event::SpeakDone).unwrap();
+        let json = serde_json::to_string(&Event::SpeakDone {
+            request_id: Some("req-001".to_string()),
+            reason: "completed".to_string(),
+        }).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["event"], "speak_done");
+        assert_eq!(v["request_id"], "req-001");
+        assert_eq!(v["reason"], "completed");
+    }
+
+    #[test]
+    fn serialize_speak_done_interrupted() {
+        let json = serde_json::to_string(&Event::SpeakDone {
+            request_id: None,
+            reason: "interrupted".to_string(),
+        }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "speak_done");
+        assert!(v.get("request_id").is_none());
+        assert_eq!(v["reason"], "interrupted");
     }
 
     #[test]
@@ -309,6 +350,7 @@ mod tests {
             r#"{"cmd":"speak_chunk","text":"Hello world."}"#,
             r#"{"cmd":"speak_end"}"#,
             r#"{"cmd":"stop_speaking"}"#,
+            r#"{"cmd":"flush_speak","request_id":"req-001"}"#,
             r#"{"cmd":"play_audio","path":"/tmp/test.mp3"}"#,
             r#"{"cmd":"stop_playback"}"#,
             r#"{"cmd":"get_status"}"#,
@@ -333,8 +375,8 @@ mod tests {
                 end: 1.0,
                 confidence: None,
             },
-            Event::SpeakStarted,
-            Event::SpeakDone,
+            Event::SpeakStarted { request_id: Some("req-001".to_string()) },
+            Event::SpeakDone { request_id: None, reason: "completed".to_string() },
             Event::PlaybackDone,
             Event::Status { capturing: false, playing: true, speaking: false },
             Event::Error { message: "fail".to_string() },

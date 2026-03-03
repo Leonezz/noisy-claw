@@ -1,4 +1,3 @@
-import type { SttConfig } from "../ipc/protocol.js";
 import type {
   AudioSource,
   STTProvider,
@@ -8,6 +7,7 @@ import type {
   STTConfig,
   SegmentMetadata,
 } from "./interfaces.js";
+import type { SttConfig } from "../ipc/protocol.js";
 
 export type PipelineConfig = {
   audio: AudioConfig;
@@ -22,13 +22,23 @@ export type PipelineComponents = {
   audioOutput: AudioOutput;
 };
 
+let requestCounter = 0;
+function nextRequestId(): string {
+  return `req-ts-${String(++requestCounter).padStart(6, "0")}`;
+}
+
+// Sentence boundary characters for chunking LLM deltas
+const SENTENCE_BOUNDARY = /[。！？.!?\n]/;
+
 export class PipelineCoordinator {
   private readonly components: PipelineComponents;
   private messageCallbacks: Array<(message: string, metadata: SegmentMetadata) => void> = [];
   private active = false;
   private paused = false;
-  private echoSuppressed = false;
   private currentConfig: PipelineConfig | null = null;
+  private activeRequestId: string | null = null;
+  // Sentence chunking buffer for streaming TTS
+  private chunkBuffer = "";
 
   constructor(components: PipelineComponents) {
     this.components = components;
@@ -38,46 +48,17 @@ export class PipelineCoordinator {
   private wireComponents(): void {
     const { audioSource, sttProvider, segmentation, audioOutput } = this.components;
 
-    // Interruption detection: VAD during echo suppression triggers barge-in.
-    // Rust hybrid VAD gate already requires ~192ms of sustained speech at 0.85
-    // threshold before emitting Vad{speaking:true}, so we only add a short
-    // confirmation window here to avoid double-gating.
-    let interruptTimer: ReturnType<typeof setTimeout> | null = null;
-    const INTERRUPT_THRESHOLD_MS = 50;
-
-    // AudioSource VAD -> SegmentationEngine (or interruption during echo suppression)
+    // AudioSource VAD -> SegmentationEngine
+    // Barge-in is now handled entirely in Rust (VAD node detects speech
+    // during TTS and sends barge-in signal to orchestrator).
     audioSource.onVAD((speaking) => {
-      if (!this.echoSuppressed) {
-        segmentation.onVAD(speaking);
-        return;
-      }
-
-      // During echo suppression: detect sustained speech as user interruption
-      console.log(`[noisy-claw] VAD during echo suppression: speaking=${speaking}`);
-      if (speaking) {
-        if (!interruptTimer) {
-          console.log(`[noisy-claw] barge-in timer started (${INTERRUPT_THRESHOLD_MS}ms)`);
-          interruptTimer = setTimeout(() => {
-            interruptTimer = null;
-            console.log("[noisy-claw] barge-in confirmed — stopping TTS output");
-            audioOutput.stop();
-            this.echoSuppressed = false;
-          }, INTERRUPT_THRESHOLD_MS);
-        }
-      } else {
-        if (interruptTimer) {
-          console.log("[noisy-claw] barge-in cancelled — speech stopped");
-          clearTimeout(interruptTimer);
-          interruptTimer = null;
-        }
-      }
+      segmentation.onVAD(speaking);
     });
 
-    // AudioSource audio chunks -> STTProvider (when not suppressed)
+    // AudioSource audio chunks -> STTProvider
+    // Echo cancellation and VAD gating are handled in Rust, so we always feed.
     audioSource.onAudio((chunk) => {
-      if (!this.echoSuppressed) {
-        sttProvider.feed(chunk);
-      }
+      sttProvider.feed(chunk);
     });
 
     // STTProvider transcripts -> SegmentationEngine
@@ -92,10 +73,10 @@ export class PipelineCoordinator {
       }
     });
 
-    // AudioOutput done -> un-suppress STT
-    audioOutput.onDone(() => {
-      console.log("[noisy-claw] audioOutput.onDone: echoSuppressed=false");
-      this.echoSuppressed = false;
+    // AudioOutput done -> reset active request
+    audioOutput.onDone((requestId, reason) => {
+      console.log(`[noisy-claw] audioOutput.onDone: requestId=${requestId} reason=${reason}`);
+      this.activeRequestId = null;
     });
   }
 
@@ -140,25 +121,42 @@ export class PipelineCoordinator {
     return this.paused;
   }
 
-  async speak(text: string): Promise<void> {
-    console.log("[noisy-claw] pipeline.speak: echoSuppressed=true");
-    this.echoSuppressed = true;
-    await this.components.audioOutput.speak(text);
+  speak(text: string): void {
+    const requestId = nextRequestId();
+    this.activeRequestId = requestId;
+    console.log(`[noisy-claw] pipeline.speak: requestId=${requestId}`);
+    this.components.audioOutput.speak(text, requestId);
   }
 
   speakStart(): void {
-    console.log("[noisy-claw] pipeline.speakStart: echoSuppressed=true");
-    this.echoSuppressed = true;
-    this.components.audioOutput.speakStart?.();
+    const requestId = nextRequestId();
+    this.activeRequestId = requestId;
+    this.chunkBuffer = "";
+    console.log(`[noisy-claw] pipeline.speakStart: requestId=${requestId}`);
+    this.components.audioOutput.speakStart(requestId);
   }
 
   speakChunk(text: string): void {
-    this.components.audioOutput.speakChunk?.(text);
+    if (!this.activeRequestId) return;
+    // Buffer text and flush at sentence boundaries
+    this.chunkBuffer += text;
+    let boundary = this.chunkBuffer.search(SENTENCE_BOUNDARY);
+    while (boundary !== -1) {
+      const sentence = this.chunkBuffer.slice(0, boundary + 1);
+      this.chunkBuffer = this.chunkBuffer.slice(boundary + 1);
+      this.components.audioOutput.speakChunk(sentence, this.activeRequestId);
+      boundary = this.chunkBuffer.search(SENTENCE_BOUNDARY);
+    }
   }
 
-  async speakEnd(): Promise<void> {
-    await this.components.audioOutput.speakEnd?.();
-    this.echoSuppressed = false;
+  speakEnd(): void {
+    if (!this.activeRequestId) return;
+    // Flush remaining buffered text
+    if (this.chunkBuffer.length > 0) {
+      this.components.audioOutput.speakChunk(this.chunkBuffer, this.activeRequestId);
+      this.chunkBuffer = "";
+    }
+    this.components.audioOutput.speakEnd(this.activeRequestId);
   }
 
   onMessage(cb: (message: string, metadata: SegmentMetadata) => void): void {
