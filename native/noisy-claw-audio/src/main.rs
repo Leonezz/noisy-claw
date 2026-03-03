@@ -132,7 +132,6 @@ async fn main() -> Result<()> {
                         let should_exit = handle_command(
                             cmd,
                             &capture_handle,
-                            &aec_handle,
                             &vad_handle,
                             &stt_handle,
                             &tts_handle,
@@ -192,9 +191,14 @@ async fn main() -> Result<()> {
 
                     is_speaking_tts = false;
                     tts_speaking_tx.send_replace(false);
-                    vad_handle.set_threshold(0.5).await;
+
+                    // Keep threshold at 0.85 briefly and apply post-flush
+                    // blanking so residual speaker audio doesn't re-trigger
+                    // barge-in. The blanking countdown will expire, then
+                    // normal-mode VAD (threshold 0.5) resumes naturally
+                    // when speaking_tts becomes false.
+                    vad_handle.post_flush_blanking().await;
                     vad_handle.reset().await;
-                    aec_handle.reset_buffers().await;
 
                     let _ = event_tx.send(Event::SpeakDone {
                         request_id: Some(req_id),
@@ -212,9 +216,8 @@ async fn main() -> Result<()> {
                             let req_id = active_request_id.take();
                             is_speaking_tts = false;
                             tts_speaking_tx.send_replace(false);
-                            vad_handle.set_threshold(0.5).await;
+                            vad_handle.post_flush_blanking().await;
                             vad_handle.reset().await;
-                            aec_handle.reset_buffers().await;
                             let _ = event_tx.send(Event::SpeakDone {
                                 request_id: req_id,
                                 reason: "completed".to_string(),
@@ -241,7 +244,6 @@ async fn main() -> Result<()> {
 async fn handle_command(
     cmd: Command,
     capture_handle: &pipeline::capture::Handle,
-    aec_handle: &pipeline::aec::Handle,
     vad_handle: &pipeline::vad::Handle,
     stt_handle: &pipeline::stt::Handle,
     tts_handle: &pipeline::tts::Handle,
@@ -359,9 +361,8 @@ async fn handle_command(
                 }).await;
                 *is_speaking_tts = false;
                 tts_speaking_tx.send_replace(false);
-                vad_handle.set_threshold(0.5).await;
+                vad_handle.post_flush_blanking().await;
                 vad_handle.reset().await;
-                aec_handle.reset_buffers().await;
                 let _ = event_tx.send(Event::SpeakDone {
                     request_id: Some(request_id),
                     reason: "interrupted".to_string(),
@@ -379,9 +380,8 @@ async fn handle_command(
                 // Reset pipeline state
                 *is_speaking_tts = false;
                 tts_speaking_tx.send_replace(false);
-                vad_handle.set_threshold(0.5).await;
+                vad_handle.post_flush_blanking().await;
                 vad_handle.reset().await;
-                aec_handle.reset_buffers().await;
                 let _ = event_tx.send(Event::SpeakDone {
                     request_id: req_id,
                     reason: "stopped".to_string(),

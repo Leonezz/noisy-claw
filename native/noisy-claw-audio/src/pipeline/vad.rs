@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -20,10 +19,10 @@ const BARGE_IN_FRAME_COUNT: u32 = 4;
 /// probability dips from prematurely cutting off audio to STT.
 const SPEECH_END_FRAME_COUNT: u32 = 6;
 
-/// Pre-roll buffer size: ~200ms at 16kHz = 3200 samples.
-/// Stores recent audio so that speech onset (lost during the barge-in
-/// detection window) can be replayed to STT on confirmed barge-in.
-const PRE_ROLL_SAMPLES: usize = 3200;
+/// Post-flush settling: suppress barge-in detection for this many VAD
+/// windows after a flush, giving speaker hardware time to go silent and
+/// AEC time to stabilize (~192ms at 32ms/window).
+const POST_FLUSH_BLANKING_FRAMES: u32 = 6;
 
 /// Comfort blanking: suppress barge-in detection for this many VAD windows
 /// after TTS starts, giving AEC time to converge (~192ms at 32ms/window).
@@ -40,6 +39,9 @@ pub enum Control {
     /// Cancel a pending barge-in (false alarm). Resets gating state so audio
     /// stops flowing to STT during TTS, and emits speaking:false events.
     CancelBargeIn,
+    /// Apply post-flush blanking: suppress barge-in detection briefly while
+    /// residual speaker audio dies out and AEC stabilizes.
+    PostFlushBlanking,
     Shutdown,
 }
 
@@ -60,6 +62,10 @@ impl Handle {
 
     pub async fn cancel_barge_in(&self) {
         let _ = self.control_tx.send(Control::CancelBargeIn).await;
+    }
+
+    pub async fn post_flush_blanking(&self) {
+        let _ = self.control_tx.send(Control::PostFlushBlanking).await;
     }
 
     pub async fn shutdown(self) {
@@ -130,11 +136,6 @@ pub fn spawn(
         // barge-in during the initial convergence period.
         let mut first_audio_time: Option<Instant> = None;
 
-        // Pre-roll buffer: always stores the last ~200ms of AEC-cleaned audio.
-        // On confirmed barge-in, this buffer is replayed to STT so the speech
-        // onset (captured during the detection window) is not lost.
-        let mut pre_roll: VecDeque<f32> = VecDeque::with_capacity(PRE_ROLL_SAMPLES + 512);
-
         // Comfort blanking: countdown of VAD windows to suppress barge-in
         // after TTS starts, giving AEC time to converge on the new signal.
         let mut blanking_countdown: u32 = 0;
@@ -170,6 +171,14 @@ pub fn spawn(
                             }
                             tracing::info!("VAD node: barge-in cancelled (false alarm)");
                         }
+                        Control::PostFlushBlanking => {
+                            blanking_countdown = POST_FLUSH_BLANKING_FRAMES;
+                            consecutive_speech_frames = 0;
+                            tracing::info!(
+                                blanking_frames = POST_FLUSH_BLANKING_FRAMES,
+                                "VAD node: post-flush blanking active"
+                            );
+                        }
                         Control::Shutdown => {
                             tracing::info!("VAD node: shutdown");
                             break;
@@ -197,14 +206,6 @@ pub fn spawn(
                     }
                     prev_speaking_tts = speaking_tts;
 
-                    // Always update pre-roll buffer (ring buffer of recent audio)
-                    for &s in &frame.samples {
-                        if pre_roll.len() >= PRE_ROLL_SAMPLES {
-                            pre_roll.pop_front();
-                        }
-                        pre_roll.push_back(s);
-                    }
-
                     // Audio forwarding to STT:
                     // - Normal mode (no TTS): always forward
                     // - TTS mode: only forward after barge-in confirmed (was_speaking)
@@ -223,6 +224,15 @@ pub fn spawn(
                     };
 
                     for w in results {
+                        // Blanking countdown: suppress VAD events during
+                        // comfort blanking (TTS start) or post-flush settling.
+                        // Runs regardless of speaking_tts state.
+                        if blanking_countdown > 0 {
+                            blanking_countdown -= 1;
+                            consecutive_speech_frames = 0;
+                            continue;
+                        }
+
                         if speaking_tts {
                             log_counter += 1;
 
@@ -232,17 +242,8 @@ pub fn spawn(
                                     is_speech = w.is_speech,
                                     consecutive = consecutive_speech_frames,
                                     threshold = v.threshold(),
-                                    blanking = blanking_countdown,
                                     "VAD node: TTS gate"
                                 );
-                            }
-
-                            // Comfort blanking: suppress barge-in detection
-                            // while AEC converges on new TTS audio
-                            if blanking_countdown > 0 {
-                                blanking_countdown -= 1;
-                                consecutive_speech_frames = 0;
-                                continue;
                             }
 
                             // AEC warmup: suppress barge-in during initial
@@ -271,20 +272,8 @@ pub fn spawn(
                                     tracing::info!(
                                         consecutive_speech_frames,
                                         prob = format!("{:.3}", w.speech_prob),
-                                        pre_roll_samples = pre_roll.len(),
-                                        "VAD node: barge-in confirmed, sending pre-roll"
+                                        "VAD node: barge-in confirmed"
                                     );
-
-                                    // Replay pre-roll buffer to STT so speech onset
-                                    // captured during the detection window is preserved
-                                    if !pre_roll.is_empty() {
-                                        let pre_roll_samples: Vec<f32> =
-                                            pre_roll.drain(..).collect();
-                                        let _ = audio_passthrough_tx.send(AudioFrame {
-                                            samples: pre_roll_samples,
-                                            sample_rate: frame.sample_rate,
-                                        });
-                                    }
 
                                     let _ = barge_in_tx.send(()).await;
                                     let _ = event_tx.send(Event::Vad { speaking: true }).await;
