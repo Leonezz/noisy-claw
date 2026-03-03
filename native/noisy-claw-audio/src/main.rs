@@ -14,41 +14,13 @@ use protocol::{Command, Event};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::{mpsc, watch};
-use tokio::time::Sleep;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn next_request_id() -> String {
     let n = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("req-{n:06}")
-}
-
-/// Timeout for barge-in evaluation: if no meaningful transcript arrives
-/// within this window, the interruption is treated as a false alarm.
-/// Audio keeps playing during evaluation — flush only on confirmation.
-const FALSE_INTERRUPTION_TIMEOUT: Duration = Duration::from_secs(2);
-
-/// Minimum number of transcribed words required to confirm a barge-in.
-const MIN_INTERRUPTION_WORDS: usize = 1;
-
-/// Check if a transcript is a backchannel (filler word) that should not
-/// trigger a barge-in. Covers common English and Chinese backchannels.
-fn is_backchannel(text: &str) -> bool {
-    let normalized = text.trim().to_lowercase();
-    if normalized.is_empty() {
-        return true;
-    }
-    const BACKCHANNELS: &[&str] = &[
-        // English
-        "yeah", "yes", "uh-huh", "uh huh", "mm-hmm", "mm hmm", "mmhmm",
-        "okay", "ok", "right", "sure", "hmm", "mhm", "yep", "yup", "ah",
-        // Chinese
-        "嗯", "哦", "好", "对", "是", "啊", "好的", "对对", "嗯嗯", "哦哦",
-        "是的", "对的", "行",
-    ];
-    BACKCHANNELS.iter().any(|b| normalized == *b)
 }
 
 #[tokio::main]
@@ -88,8 +60,6 @@ async fn main() -> Result<()> {
     let (output_msg_tx, output_msg_rx) = mpsc::channel(64);      // tts → output
     let (internal_tx, mut internal_rx) = mpsc::channel(16);       // output → orchestrator
     let (barge_in_tx, mut barge_in_rx) = mpsc::channel::<()>(4);  // vad → orchestrator (barge-in)
-    let (transcript_notify_tx, mut transcript_notify_rx) =
-        mpsc::channel::<pipeline::TranscriptEvent>(16);            // stt → orchestrator (evaluation)
 
     // ── Spawn pipeline nodes ───────────────────────────────────────────
     let models_dir = resolve_models_dir();
@@ -121,7 +91,6 @@ async fn main() -> Result<()> {
         vad_audio_rx,
         vad_event_rx,
         event_tx.clone(),
-        transcript_notify_tx,
     );
     tracing::info!("orchestrator: STT node spawned");
 
@@ -138,12 +107,6 @@ async fn main() -> Result<()> {
     // ── Orchestrator state ─────────────────────────────────────────────
     let mut is_speaking_tts = false;
     let mut active_request_id: Option<String> = None;
-
-    // Barge-in evaluation state: when VAD signals a potential barge-in,
-    // we wait for a meaningful transcript before flushing. Audio keeps
-    // playing — no pause/resume needed since we have AEC.
-    let mut pending_barge_in: Option<String> = None; // request_id being evaluated
-    let mut barge_in_timer: Option<std::pin::Pin<Box<Sleep>>> = None;
 
     // ── Ready ──────────────────────────────────────────────────────────
     event_tx.send(Event::Ready).await?;
@@ -183,11 +146,6 @@ async fn main() -> Result<()> {
                             &mut is_speaking_tts,
                             &mut active_request_id,
                         ).await;
-                        // If a command stopped TTS, cancel any pending barge-in evaluation
-                        if !is_speaking_tts && pending_barge_in.is_some() {
-                            pending_barge_in = None;
-                            barge_in_timer = None;
-                        }
                         if should_exit {
                             break;
                         }
@@ -215,84 +173,33 @@ async fn main() -> Result<()> {
                 let _ = event_tx.send(Event::PlaybackDone).await;
             }
 
-            // ── VAD barge-in: start evaluation (audio keeps playing) ────
+            // ── VAD barge-in: immediate flush cascade ────────────────
             Some(()) = barge_in_rx.recv() => {
-                if is_speaking_tts && pending_barge_in.is_none() {
-                    let req_id = active_request_id.clone().unwrap_or_default();
-                    pending_barge_in = Some(req_id.clone());
-                    barge_in_timer = Some(Box::pin(
-                        tokio::time::sleep(FALSE_INTERRUPTION_TIMEOUT),
-                    ));
-                    tracing::info!(
-                        %req_id,
-                        "orchestrator: potential barge-in, waiting for transcript confirmation"
-                    );
-                }
-            }
+                if is_speaking_tts {
+                    let req_id = active_request_id.take().unwrap_or_default();
+                    tracing::info!(%req_id, "orchestrator: barge-in confirmed, flushing");
 
-            // ── STT transcript during barge-in evaluation ───────────────
-            Some(transcript) = transcript_notify_rx.recv() => {
-                if let Some(ref pending_req_id) = pending_barge_in {
-                    let word_count = transcript.text.split_whitespace().count();
+                    // Full flush cascade
+                    let tts_ack = tts_handle.flush(pipeline::FlushSignal::Flush {
+                        request_id: req_id.clone(),
+                    }).await;
+                    tracing::info!(node = ?tts_ack.node, "orchestrator: TTS flush ack");
 
-                    if word_count >= MIN_INTERRUPTION_WORDS
-                        && !is_backchannel(&transcript.text)
-                    {
-                        // Confirmed: meaningful speech detected
-                        let req_id = pending_req_id.clone();
-                        pending_barge_in = None;
-                        barge_in_timer = None;
-                        active_request_id = None;
+                    let out_ack = output_handle.flush(pipeline::FlushSignal::Flush {
+                        request_id: req_id.clone(),
+                    }).await;
+                    tracing::info!(node = ?out_ack.node, "orchestrator: Output flush ack");
 
-                        tracing::info!(
-                            text = %transcript.text,
-                            word_count,
-                            "orchestrator: barge-in confirmed by transcript"
-                        );
+                    is_speaking_tts = false;
+                    tts_speaking_tx.send_replace(false);
+                    vad_handle.set_threshold(0.5).await;
+                    vad_handle.reset().await;
+                    aec_handle.reset_buffers().await;
 
-                        // Full flush cascade
-                        let tts_ack = tts_handle.flush(pipeline::FlushSignal::Flush {
-                            request_id: req_id.clone(),
-                        }).await;
-                        tracing::info!(node = ?tts_ack.node, "orchestrator: TTS flush ack");
-
-                        let out_ack = output_handle.flush(pipeline::FlushSignal::Flush {
-                            request_id: req_id.clone(),
-                        }).await;
-                        tracing::info!(node = ?out_ack.node, "orchestrator: Output flush ack");
-
-                        is_speaking_tts = false;
-                        tts_speaking_tx.send_replace(false);
-                        vad_handle.set_threshold(0.5).await;
-                        vad_handle.reset().await;
-                        aec_handle.reset_buffers().await;
-
-                        let _ = event_tx.send(Event::SpeakDone {
-                            request_id: Some(req_id),
-                            reason: "interrupted".to_string(),
-                        }).await;
-                    } else {
-                        tracing::info!(
-                            text = %transcript.text,
-                            word_count,
-                            "orchestrator: transcript during evaluation (backchannel/insufficient)"
-                        );
-                    }
-                }
-            }
-
-            // ── Barge-in evaluation timeout: false alarm ────────────────
-            _ = async {
-                match barge_in_timer.as_mut() {
-                    Some(timer) => timer.as_mut().await,
-                    None => std::future::pending().await,
-                }
-            } => {
-                barge_in_timer = None;
-                if pending_barge_in.is_some() {
-                    pending_barge_in = None;
-                    vad_handle.cancel_barge_in().await;
-                    tracing::info!("orchestrator: false interruption, audio was never paused");
+                    let _ = event_tx.send(Event::SpeakDone {
+                        request_id: Some(req_id),
+                        reason: "interrupted".to_string(),
+                    }).await;
                 }
             }
 
@@ -300,12 +207,6 @@ async fn main() -> Result<()> {
             Some(internal_event) = internal_rx.recv() => {
                 match internal_event {
                     pipeline::OutputNodeEvent::SpeakDone => {
-                        // Cancel pending evaluation if TTS finished naturally
-                        if pending_barge_in.is_some() {
-                            pending_barge_in = None;
-                            barge_in_timer = None;
-                        }
-
                         tracing::info!("orchestrator: speak done (natural)");
                         if is_speaking_tts {
                             let req_id = active_request_id.take();

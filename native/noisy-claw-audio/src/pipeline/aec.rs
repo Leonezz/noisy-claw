@@ -138,7 +138,7 @@ async fn aec_loop(
                 // Log energy levels periodically (~every 500ms at typical frame rates)
                 log_counter += 1;
                 if log_counter % 15 == 0 {
-                    tracing::info!(
+                    tracing::debug!(
                         capture_db = format!("{:.1}", capture_energy),
                         render_db = format!("{:.1}", render_energy),
                         cleaned_db = format!("{:.1}", cleaned_energy),

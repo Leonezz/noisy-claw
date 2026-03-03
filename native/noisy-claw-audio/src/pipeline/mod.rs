@@ -56,15 +56,6 @@ pub struct VadEvent {
     pub speaking: bool,
 }
 
-/// Speech recognition result emitted by the STT node.
-pub struct TranscriptEvent {
-    pub text: String,
-    pub is_final: bool,
-    pub start: f64,
-    pub end: f64,
-    pub confidence: Option<f64>,
-}
-
 /// Messages from the output node back to the orchestrator.
 pub enum OutputNodeEvent {
     SpeakDone,

@@ -11,7 +11,7 @@ use crate::cloud::traits::{RecognizerConfig, SpeechRecognizer};
 use crate::protocol::{Event, SttConfig};
 use crate::stt::WhisperSTT;
 
-use super::{AudioFrame, TranscriptEvent, VadEvent};
+use super::{AudioFrame, VadEvent};
 
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -68,7 +68,6 @@ pub fn spawn(
     mut audio_rx: mpsc::UnboundedReceiver<AudioFrame>,
     mut vad_rx: mpsc::Receiver<VadEvent>,
     event_tx: mpsc::Sender<Event>,
-    transcript_notify_tx: mpsc::Sender<TranscriptEvent>,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
@@ -280,14 +279,6 @@ pub fn spawn(
                                 is_final = recognition.is_final,
                                 "STT node: transcript"
                             );
-                            // Notify orchestrator (non-blocking) for barge-in evaluation
-                            let _ = transcript_notify_tx.try_send(TranscriptEvent {
-                                text: recognition.text.clone(),
-                                is_final: recognition.is_final,
-                                start: recognition.start_time,
-                                end: recognition.end_time,
-                                confidence: recognition.confidence,
-                            });
                             let _ = event_tx.send(Event::Transcript {
                                 text: recognition.text,
                                 is_final: recognition.is_final,
