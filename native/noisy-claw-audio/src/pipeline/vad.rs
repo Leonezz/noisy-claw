@@ -6,9 +6,9 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::protocol::Event;
-use crate::vad::VoiceActivityDetector;
+use crate::vad::{VadWindowResult, VoiceActivityDetector};
 
-use super::{AudioFrame, VadEvent};
+use super::{AudioFrame, VadEvent, VadState};
 use super::dump;
 
 /// ~128ms at 32ms/window — number of consecutive VAD-positive frames
@@ -141,6 +141,9 @@ pub fn spawn(
         // after TTS starts, giving AEC time to converge on the new signal.
         let mut blanking_countdown: u32 = 0;
 
+        // Temporary buffer for VAD results (avoids double-borrow of vad)
+        let mut vad_results_buf: Vec<VadWindowResult> = Vec::new();
+
         loop {
             tokio::select! {
                 Some(ctl) = ctl_rx.recv() => {
@@ -207,23 +210,47 @@ pub fn spawn(
                     }
                     prev_speaking_tts = speaking_tts;
 
-                    // Audio forwarding to STT:
-                    // - Normal mode (no TTS): always forward
-                    // - TTS mode: only forward after barge-in confirmed (was_speaking)
-                    if !speaking_tts || was_speaking {
-                        dump::write("vad_pass", &frame.samples, frame.sample_rate);
-                        let _ = audio_passthrough_tx.send(frame.clone());
-                    }
-
-                    // Run VAD inference
-                    let Some(ref mut v) = vad else { continue };
-                    let results = match v.process(&frame.samples) {
-                        Ok(r) => r,
-                        Err(e) => {
-                            tracing::error!(%e, "VAD node: processing failed");
-                            continue;
+                    // Run VAD inference first to get per-frame state
+                    let (max_speech_prob, any_is_speech) = if let Some(ref mut v) = vad {
+                        match v.process(&frame.samples) {
+                            Ok(results) => {
+                                let mut max_prob: f32 = 0.0;
+                                let mut any_speech = false;
+                                for w in &results {
+                                    max_prob = max_prob.max(w.speech_prob);
+                                    any_speech = any_speech || w.is_speech;
+                                }
+                                // Process barge-in / transition logic below
+                                // (results are consumed in the for loop after forwarding)
+                                vad_results_buf.clear();
+                                vad_results_buf.extend(results);
+                                (max_prob, any_speech)
+                            }
+                            Err(e) => {
+                                tracing::error!(%e, "VAD node: processing failed");
+                                vad_results_buf.clear();
+                                (0.0, false)
+                            }
                         }
+                    } else {
+                        vad_results_buf.clear();
+                        (0.0, false)
                     };
+
+                    // Always forward frame with VAD state attached
+                    dump::write("vad_pass", &frame.samples, frame.sample_rate);
+                    let _ = audio_passthrough_tx.send(AudioFrame {
+                        samples: frame.samples,
+                        sample_rate: frame.sample_rate,
+                        vad: Some(VadState {
+                            speech_prob: max_speech_prob,
+                            is_speech: any_is_speech,
+                            speaking_tts,
+                        }),
+                    });
+
+                    // Process VAD results for barge-in logic and events
+                    let results = std::mem::take(&mut vad_results_buf);
 
                     for w in results {
                         dump::write_vad_meta(&format!(
@@ -254,7 +281,7 @@ pub fn spawn(
                                     prob = format!("{:.3}", w.speech_prob),
                                     is_speech = w.is_speech,
                                     consecutive = consecutive_speech_frames,
-                                    threshold = v.threshold(),
+                                    threshold = vad.as_ref().map(|v| v.threshold()).unwrap_or(0.0),
                                     "VAD node: TTS gate"
                                 );
                             }

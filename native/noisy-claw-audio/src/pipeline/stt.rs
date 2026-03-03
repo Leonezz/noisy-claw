@@ -212,11 +212,10 @@ pub fn spawn(
                     }
                 }
 
-                // Process AEC-cleaned audio frames
+                // Process audio frames (with VAD state attached)
                 Some(frame) = audio_rx.recv() => {
-                    // Cloud streaming STT: feed AEC-cleaned audio.
-                    // Audio is gated at the VAD layer — during TTS playback,
-                    // only speech confirmed by barge-in detection is forwarded.
+                    // Cloud streaming STT: feed all audio continuously.
+                    // VAD state is available via frame.vad for future use.
                     if using_cloud {
                         if let Some(ref mut recognizer) = cloud_recognizer {
                             if let Err(e) = recognizer.feed_audio(&frame.samples).await {

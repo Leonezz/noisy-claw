@@ -187,6 +187,7 @@ async fn aec_loop(
                 let _ = cleaned_tx.send(AudioFrame {
                     samples: cleaned_samples,
                     sample_rate: frame.sample_rate,
+                    vad: None,
                 });
             }
         }

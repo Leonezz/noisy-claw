@@ -46,10 +46,26 @@ pub trait PipelineNode: Send + 'static {
 }
 
 /// Audio data flowing between pipeline nodes.
+///
+/// Before the VAD node, `vad` is `None`.
+/// The VAD node decorates every frame with speech detection state.
 #[derive(Clone)]
 pub struct AudioFrame {
     pub samples: Vec<f32>,
     pub sample_rate: u32,
+    /// VAD state attached by the VAD node. `None` before VAD processing.
+    pub vad: Option<VadState>,
+}
+
+/// Per-frame VAD state, attached to `AudioFrame` by the VAD node.
+#[derive(Clone, Debug)]
+pub struct VadState {
+    /// Highest speech probability across VAD windows in this frame.
+    pub speech_prob: f32,
+    /// Whether any VAD window in this frame detected speech.
+    pub is_speech: bool,
+    /// Whether TTS was playing when this frame was processed.
+    pub speaking_tts: bool,
 }
 
 /// VAD state transition emitted by the VAD node.

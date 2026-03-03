@@ -135,6 +135,7 @@ pub fn spawn(
                                             let _ = ref_tx.send(AudioFrame {
                                                 samples,
                                                 sample_rate: output_rate,
+                                                vad: None,
                                             });
                                         }
                                     }));

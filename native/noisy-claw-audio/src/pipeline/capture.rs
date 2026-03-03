@@ -98,6 +98,7 @@ pub fn spawn(audio_tx: mpsc::UnboundedSender<AudioFrame>) -> Handle {
                     let _ = audio_tx.send(AudioFrame {
                         samples,
                         sample_rate: current_sample_rate,
+                        vad: None,
                     });
                 }
             }
