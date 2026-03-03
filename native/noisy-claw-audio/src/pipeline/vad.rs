@@ -9,6 +9,7 @@ use crate::protocol::Event;
 use crate::vad::VoiceActivityDetector;
 
 use super::{AudioFrame, VadEvent};
+use super::dump;
 
 /// ~128ms at 32ms/window — number of consecutive VAD-positive frames
 /// required before confirming barge-in during TTS playback.
@@ -210,6 +211,7 @@ pub fn spawn(
                     // - Normal mode (no TTS): always forward
                     // - TTS mode: only forward after barge-in confirmed (was_speaking)
                     if !speaking_tts || was_speaking {
+                        dump::write("vad_pass", &frame.samples, frame.sample_rate);
                         let _ = audio_passthrough_tx.send(frame.clone());
                     }
 
@@ -224,9 +226,20 @@ pub fn spawn(
                     };
 
                     for w in results {
-                        // Blanking countdown: suppress VAD events during
-                        // comfort blanking (TTS start) or post-flush settling.
-                        // Runs regardless of speaking_tts state.
+                        dump::write_vad_meta(&format!(
+                            "{:.1},{:.4},{},{},{},{}\n",
+                            first_audio_time.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0),
+                            w.speech_prob,
+                            w.is_speech as u8,
+                            speaking_tts as u8,
+                            blanking_countdown,
+                            was_speaking as u8
+                        ));
+
+                        // Blanking: suppress VAD events during comfort blanking
+                        // (TTS start) or post-flush settling. Must run in ALL
+                        // modes because speaking_tts is already false when
+                        // post-flush blanking fires.
                         if blanking_countdown > 0 {
                             blanking_countdown -= 1;
                             consecutive_speech_frames = 0;

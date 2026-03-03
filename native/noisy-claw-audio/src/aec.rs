@@ -1,39 +1,59 @@
-use aec3::voip::VoipAec3;
 use anyhow::Result;
+use webrtc_audio_processing::Processor;
+use webrtc_audio_processing_config::{
+    Config,
+    EchoCanceller as AecConfig,
+    HighPassFilter, NoiseSuppression,
+};
 
 use crate::audio_utils::resample_linear;
 
 /// AEC runs at 48kHz to match the typical output device rate.
 /// This avoids downsampling the render reference (which would introduce
-/// aliasing from the simple linear resampler), giving AEC3 a clean
+/// aliasing from the simple linear resampler), giving AEC a clean
 /// reference signal that accurately matches the speaker output.
 const AEC_SAMPLE_RATE: u32 = 48000;
-const AEC_FRAME_SIZE: usize = 480; // 10ms at 48kHz
 
 pub struct EchoCanceller {
-    aec: VoipAec3,
+    processor: Processor,
     render_buf: Vec<f32>,
     capture_buf: Vec<f32>,
+    frame_size: usize,
 }
 
 impl EchoCanceller {
     pub fn new() -> Result<Self> {
-        let aec = VoipAec3::builder(AEC_SAMPLE_RATE as usize, 1, 1)
-            .initial_delay_ms(50)
-            .enable_high_pass(true)
-            .build()
-            .map_err(|e| anyhow::anyhow!("aec3 init failed: {:?}", e))?;
+        let processor = Processor::new(AEC_SAMPLE_RATE)
+            .map_err(|e| anyhow::anyhow!("webrtc-audio-processing init: {:?}", e))?;
+
+        let config = Config {
+            echo_canceller: Some(AecConfig::Full {
+                stream_delay_ms: None,
+            }),
+            noise_suppression: Some(NoiseSuppression {
+                level: webrtc_audio_processing_config::NoiseSuppressionLevel::Moderate,
+                analyze_linear_aec_output: false,
+            }),
+            high_pass_filter: Some(HighPassFilter {
+                apply_in_full_band: true,
+            }),
+            ..Default::default()
+        };
+        processor.set_config(config);
+
+        let frame_size = processor.num_samples_per_frame(); // 480 at 48kHz
 
         Ok(Self {
-            aec,
+            processor,
             render_buf: Vec::new(),
             capture_buf: Vec::new(),
+            frame_size,
         })
     }
 
     /// Feed speaker reference audio (output going to speakers).
     /// Samples should be mono f32 at any sample rate — will be resampled to 48kHz if needed.
-    /// Each complete 480-sample frame is immediately passed to the AEC engine.
+    /// Each complete frame is immediately passed to the AEC engine.
     pub fn feed_render(&mut self, samples: &[f32], sample_rate: u32) {
         let resampled = if sample_rate != AEC_SAMPLE_RATE {
             resample_linear(samples, sample_rate, AEC_SAMPLE_RATE)
@@ -42,14 +62,14 @@ impl EchoCanceller {
         };
         self.render_buf.extend_from_slice(&resampled);
 
-        // Feed complete 10ms frames to the AEC engine immediately
-        while self.render_buf.len() >= AEC_FRAME_SIZE {
-            let frame: Vec<f32> = self.render_buf.drain(..AEC_FRAME_SIZE).collect();
-            let _ = self.aec.handle_render_frame(&frame);
+        while self.render_buf.len() >= self.frame_size {
+            let frame_buf: Vec<f32> = self.render_buf.drain(..self.frame_size).collect();
+            let mut channels = vec![frame_buf];
+            let _ = self.processor.process_render_frame(&mut channels);
         }
     }
 
-    /// Process microphone capture audio through AEC.
+    /// Process microphone capture audio through AEC + noise suppression + HPF.
     /// Samples should be mono f32 at any sample rate — will be resampled to 48kHz internally.
     /// Returns cleaned audio at the original sample rate.
     pub fn process_capture(&mut self, samples: &[f32], sample_rate: u32) -> Vec<f32> {
@@ -61,19 +81,15 @@ impl EchoCanceller {
         self.capture_buf.extend_from_slice(&resampled);
 
         let mut cleaned_48k = Vec::new();
-
-        // Process complete 10ms frames
-        while self.capture_buf.len() >= AEC_FRAME_SIZE {
-            let cap_frame: Vec<f32> = self.capture_buf.drain(..AEC_FRAME_SIZE).collect();
-            let mut out = vec![0.0f32; AEC_FRAME_SIZE];
-
-            match self.aec.process_capture_frame(&cap_frame, false, &mut out) {
-                Ok(_) => cleaned_48k.extend_from_slice(&out),
-                Err(_) => cleaned_48k.extend_from_slice(&cap_frame),
+        while self.capture_buf.len() >= self.frame_size {
+            let frame_buf: Vec<f32> = self.capture_buf.drain(..self.frame_size).collect();
+            let mut channels = vec![frame_buf];
+            match self.processor.process_capture_frame(&mut channels) {
+                Ok(_) => cleaned_48k.extend_from_slice(&channels[0]),
+                Err(_) => cleaned_48k.extend_from_slice(&channels[0]), // passthrough on error
             }
         }
 
-        // Resample back to original rate if needed
         if sample_rate != AEC_SAMPLE_RATE && !cleaned_48k.is_empty() {
             resample_linear(&cleaned_48k, AEC_SAMPLE_RATE, sample_rate)
         } else {
@@ -81,7 +97,7 @@ impl EchoCanceller {
         }
     }
 
-    /// Reset internal accumulation buffers (does NOT reset AEC3 filter state).
+    /// Reset internal accumulation buffers (does NOT reset AEC filter state).
     pub fn reset_buffers(&mut self) {
         self.capture_buf.clear();
         self.render_buf.clear();

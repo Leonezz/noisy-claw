@@ -10,6 +10,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::audio_utils::resample_linear;
+use crate::pipeline::dump;
 
 pub struct StreamingOutput {
     _stream: Stream,
@@ -100,6 +101,9 @@ impl StreamingOutput {
                         data[frame_idx * ch + c] = sample;
                     }
                 }
+
+                // Dump actual speaker output (at device native rate)
+                dump::write("speaker_out", &mono_ref, native_rate);
 
                 // Send reference (silence during pause) to AEC
                 let _ = ref_tx.send(mono_ref);

@@ -31,9 +31,13 @@ async fn main() -> Result<()> {
         .with_line_number(true)
         .with_target(false)
         .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "noisy_claw_audio=info".to_string()),
+            std::env::var("RUST_LOG").unwrap_or_else(|_| "noisy_claw_audio=trace".to_string()),
         )
         .init();
+
+    // ── Audio dump (opt-in via AUDIO_DUMP_DIR env var) ────────────────
+    let dump_enabled = pipeline::dump::init();
+    tracing::info!(dump_enabled, "audio dump");
 
     // ── IPC event channel → stdout writer ──────────────────────────────
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
@@ -198,6 +202,7 @@ async fn main() -> Result<()> {
                     // normal-mode VAD (threshold 0.5) resumes naturally
                     // when speaking_tts becomes false.
                     vad_handle.post_flush_blanking().await;
+
                     vad_handle.reset().await;
 
                     let _ = event_tx.send(Event::SpeakDone {
@@ -217,6 +222,7 @@ async fn main() -> Result<()> {
                             is_speaking_tts = false;
                             tts_speaking_tx.send_replace(false);
                             vad_handle.post_flush_blanking().await;
+        
                             vad_handle.reset().await;
                             let _ = event_tx.send(Event::SpeakDone {
                                 request_id: req_id,
@@ -230,6 +236,7 @@ async fn main() -> Result<()> {
     }
 
     // ── Shutdown ───────────────────────────────────────────────────────
+    pipeline::dump::finish();
     capture_handle.shutdown().await;
     aec_handle.shutdown().await;
     vad_handle.shutdown().await;

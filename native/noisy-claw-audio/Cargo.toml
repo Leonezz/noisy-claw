@@ -30,7 +30,8 @@ async-trait = "0.1"
 uuid = { version = "1", features = ["v4"] }
 
 # Echo cancellation
-aec3 = "0.1"
+webrtc-audio-processing = { version = "2.0", features = ["bundled"] }
+webrtc-audio-processing-config = "2.0"
 
 # Ring buffer for streaming output
 ringbuf = "0.4"

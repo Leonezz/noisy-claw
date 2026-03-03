@@ -1,5 +1,6 @@
 pub mod aec;
 pub mod capture;
+pub mod dump;
 pub mod output;
 pub mod stt;
 pub mod tts;

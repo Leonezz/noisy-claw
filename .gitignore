@@ -7,5 +7,11 @@ native/noisy-claw-audio/target/
 # Node
 node_modules/
 
+# Python venv
+.venv/
+
+# Audio dump data
+native/noisy-claw-audio/dump/
+
 # OS
 .DS_Store

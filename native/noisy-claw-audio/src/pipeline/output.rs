@@ -7,6 +7,7 @@ use tokio::task::JoinHandle;
 use crate::output::StreamingOutput;
 
 use super::{AudioFrame, FlushAck, FlushSignal, NodeId, OutputMessage, OutputNodeEvent, RequestId};
+use super::dump;
 use tokio::sync::oneshot;
 
 pub enum Control {
@@ -154,6 +155,8 @@ pub fn spawn(
                         }
 
                         OutputMessage::AudioChunk { request_id, samples, sample_rate: chunk_sr } => {
+                            dump::write("tts_out", &samples, chunk_sr);
+
                             if active_request_id.as_ref() != Some(&request_id) {
                                 tracing::debug!(
                                     ?request_id,
