@@ -15,6 +15,11 @@ use super::{AudioFrame, VadEvent};
 /// required before confirming barge-in during TTS playback.
 const BARGE_IN_FRAME_COUNT: u32 = 4;
 
+/// ~192ms at 32ms/window — number of consecutive VAD-negative frames
+/// required before ending speech tracking during TTS. Prevents brief
+/// probability dips from prematurely cutting off audio to STT.
+const SPEECH_END_FRAME_COUNT: u32 = 6;
+
 /// Pre-roll buffer size: ~200ms at 16kHz = 3200 samples.
 /// Stores recent audio so that speech onset (lost during the barge-in
 /// detection window) can be replayed to STT on confirmed barge-in.
@@ -116,6 +121,7 @@ pub fn spawn(
         tracing::info!("VAD node: task started");
 
         let mut consecutive_speech_frames: u32 = 0;
+        let mut consecutive_silence_frames: u32 = 0;
         let mut was_speaking = false;
         let mut log_counter: u32 = 0;
         let mut prev_speaking_tts = false;
@@ -148,6 +154,7 @@ pub fn spawn(
                                 v.reset();
                             }
                             consecutive_speech_frames = 0;
+                            consecutive_silence_frames = 0;
                             was_speaking = false;
                             blanking_countdown = 0;
                             tracing::info!("VAD node: reset");
@@ -155,6 +162,7 @@ pub fn spawn(
                         Control::CancelBargeIn => {
                             // False alarm recovery: re-enable audio gating
                             consecutive_speech_frames = 0;
+                            consecutive_silence_frames = 0;
                             if was_speaking {
                                 was_speaking = false;
                                 let _ = event_tx.send(Event::Vad { speaking: false }).await;
@@ -219,7 +227,7 @@ pub fn spawn(
                             log_counter += 1;
 
                             if log_counter % 15 == 0 {
-                                tracing::info!(
+                                tracing::debug!(
                                     prob = format!("{:.3}", w.speech_prob),
                                     is_speech = w.is_speech,
                                     consecutive = consecutive_speech_frames,
@@ -250,6 +258,7 @@ pub fn spawn(
                             // Hybrid gate: require sustained speech for barge-in
                             if w.is_speech {
                                 consecutive_speech_frames += 1;
+                                consecutive_silence_frames = 0;
                                 if consecutive_speech_frames == 1 {
                                     tracing::info!(
                                         prob = format!("{:.3}", w.speech_prob),
@@ -285,22 +294,32 @@ pub fn spawn(
                                     was_speaking = true;
                                 }
                             } else {
-                                if consecutive_speech_frames > 0 {
+                                consecutive_speech_frames = 0;
+                                if was_speaking {
+                                    // Debounce: require sustained silence before
+                                    // ending speech tracking (avoids brief prob
+                                    // dips from cutting off audio to STT)
+                                    consecutive_silence_frames += 1;
+                                    if consecutive_silence_frames >= SPEECH_END_FRAME_COUNT {
+                                        tracing::info!(
+                                            consecutive_silence_frames,
+                                            prob = format!("{:.3}", w.speech_prob),
+                                            "VAD node: speech ended during TTS (debounced)"
+                                        );
+                                        let _ =
+                                            event_tx.send(Event::Vad { speaking: false }).await;
+                                        let _ = vad_event_tx
+                                            .send(VadEvent { speaking: false })
+                                            .await;
+                                        was_speaking = false;
+                                        consecutive_silence_frames = 0;
+                                    }
+                                } else if consecutive_speech_frames > 0 {
                                     tracing::info!(
                                         consecutive_speech_frames,
                                         prob = format!("{:.3}", w.speech_prob),
                                         "VAD node: speech streak broken during TTS"
                                     );
-                                }
-                                consecutive_speech_frames = 0;
-                                if was_speaking {
-                                    tracing::info!("VAD node: speech ended during TTS");
-                                    let _ =
-                                        event_tx.send(Event::Vad { speaking: false }).await;
-                                    let _ = vad_event_tx
-                                        .send(VadEvent { speaking: false })
-                                        .await;
-                                    was_speaking = false;
                                 }
                             }
                         } else {

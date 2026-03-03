@@ -26,8 +26,8 @@ fn next_request_id() -> String {
 }
 
 /// Timeout for barge-in evaluation: if no meaningful transcript arrives
-/// within this window, the interruption is treated as a false alarm and
-/// TTS output resumes (LiveKit-inspired pause-then-evaluate pattern).
+/// within this window, the interruption is treated as a false alarm.
+/// Audio keeps playing during evaluation — flush only on confirmation.
 const FALSE_INTERRUPTION_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Minimum number of transcribed words required to confirm a barge-in.
@@ -139,8 +139,9 @@ async fn main() -> Result<()> {
     let mut is_speaking_tts = false;
     let mut active_request_id: Option<String> = None;
 
-    // Pause-then-evaluate barge-in state: when VAD signals a potential
-    // barge-in, output is paused and we wait for a meaningful transcript.
+    // Barge-in evaluation state: when VAD signals a potential barge-in,
+    // we wait for a meaningful transcript before flushing. Audio keeps
+    // playing — no pause/resume needed since we have AEC.
     let mut pending_barge_in: Option<String> = None; // request_id being evaluated
     let mut barge_in_timer: Option<std::pin::Pin<Box<Sleep>>> = None;
 
@@ -214,18 +215,17 @@ async fn main() -> Result<()> {
                 let _ = event_tx.send(Event::PlaybackDone).await;
             }
 
-            // ── VAD barge-in: potential interruption (pause-then-evaluate) ──
+            // ── VAD barge-in: start evaluation (audio keeps playing) ────
             Some(()) = barge_in_rx.recv() => {
                 if is_speaking_tts && pending_barge_in.is_none() {
                     let req_id = active_request_id.clone().unwrap_or_default();
-                    output_handle.pause().await;
                     pending_barge_in = Some(req_id.clone());
                     barge_in_timer = Some(Box::pin(
                         tokio::time::sleep(FALSE_INTERRUPTION_TIMEOUT),
                     ));
                     tracing::info!(
                         %req_id,
-                        "orchestrator: potential barge-in, pausing output for evaluation"
+                        "orchestrator: potential barge-in, waiting for transcript confirmation"
                     );
                 }
             }
@@ -291,9 +291,8 @@ async fn main() -> Result<()> {
                 barge_in_timer = None;
                 if pending_barge_in.is_some() {
                     pending_barge_in = None;
-                    output_handle.resume().await;
                     vad_handle.cancel_barge_in().await;
-                    tracing::info!("orchestrator: false interruption, resuming output");
+                    tracing::info!("orchestrator: false interruption, audio was never paused");
                 }
             }
 
