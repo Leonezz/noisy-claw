@@ -5,35 +5,31 @@ import { createVoiceStatusTool } from "./voice-status.js";
 
 describe("createVoiceModeTool", () => {
   it("sets mode to conversation", async () => {
-    const session = new VoiceSession();
-    const tool = createVoiceModeTool(session);
+    const tool = createVoiceModeTool();
 
     const result = await tool.execute("call-1", { mode: "conversation" });
     expect(result.content[0].text).toContain("conversation");
-    expect(session.getState().mode).toBe("conversation");
+    expect(result.details.applied).toBe(true);
   });
 
-  it("rejects unimplemented modes", async () => {
-    const session = new VoiceSession();
-    const tool = createVoiceModeTool(session);
+  it("accepts meeting mode", async () => {
+    const tool = createVoiceModeTool();
 
-    const result = await tool.execute("call-1", { mode: "listen" });
-    expect(result.content[0].text).toContain("not yet implemented");
-    // Mode should remain unchanged
-    expect(session.getState().mode).toBe("conversation");
+    const result = await tool.execute("call-1", { mode: "meeting" });
+    expect(result.content[0].text).toContain("meeting");
+    expect(result.details.applied).toBe(true);
   });
 
-  it("rejects dictation mode", async () => {
-    const session = new VoiceSession();
-    const tool = createVoiceModeTool(session);
+  it("accepts dictation mode", async () => {
+    const tool = createVoiceModeTool();
 
     const result = await tool.execute("call-1", { mode: "dictation" });
-    expect(result.content[0].text).toContain("not yet implemented");
+    expect(result.content[0].text).toContain("dictation");
+    expect(result.details.applied).toBe(true);
   });
 
   it("has correct tool metadata", () => {
-    const session = new VoiceSession();
-    const tool = createVoiceModeTool(session);
+    const tool = createVoiceModeTool();
 
     expect(tool.name).toBe("voice_mode");
     expect(tool.label).toBe("Voice Mode");

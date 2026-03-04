@@ -1,4 +1,4 @@
-export type VoiceMode = "conversation" | "listen" | "dictation";
+export type VoiceMode = "conversation" | "meeting" | "dictation";
 
 export type VoiceSessionState = {
   active: boolean;

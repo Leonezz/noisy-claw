@@ -5,6 +5,7 @@ import type { AudioSource, AudioConfig, AudioChunk } from "../interfaces.js";
 export class RustLocalCapture implements AudioSource {
   private audioCallbacks: Array<(chunk: AudioChunk) => void> = [];
   private vadCallbacks: Array<(speaking: boolean) => void> = [];
+  private topicShiftCallbacks: Array<(similarity: number) => void> = [];
   private sttConfig: SttConfig | undefined;
 
   constructor(private readonly subprocess: AudioSubprocess) {}
@@ -38,11 +39,20 @@ export class RustLocalCapture implements AudioSource {
     this.vadCallbacks.push(cb);
   }
 
+  onTopicShift(cb: (similarity: number) => void): void {
+    this.topicShiftCallbacks.push(cb);
+  }
+
   /** Called by the coordinator when IPC events arrive. */
   handleEvent(event: AudioEvent): void {
     if (event.event === "vad") {
       for (const cb of this.vadCallbacks) {
         cb(event.speaking);
+      }
+    }
+    if (event.event === "topic_shift") {
+      for (const cb of this.topicShiftCallbacks) {
+        cb(event.similarity);
       }
     }
   }

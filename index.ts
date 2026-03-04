@@ -10,6 +10,7 @@ import { createVoiceListenTool } from "./src/tools/voice-listen.js";
 import { createVoiceModeTool } from "./src/tools/voice-mode.js";
 import { createVoiceSpeakTool } from "./src/tools/voice-speak.js";
 import { createVoiceStatusTool } from "./src/tools/voice-status.js";
+import { createVoiceTranscriptTool } from "./src/tools/voice-transcript.js";
 
 // Fallback session used when the gateway hasn't started yet.
 const fallbackSession = new VoiceSession();
@@ -33,7 +34,7 @@ const plugin = {
     // Register agent tools.
     // Tools use the gateway's active session when available,
     // falling back to an idle session before the channel starts.
-    api.registerTool(() => createVoiceModeTool(getActiveSession() ?? fallbackSession));
+    api.registerTool(() => createVoiceModeTool());
     api.registerTool(() => createVoiceStatusTool(getActiveSession() ?? fallbackSession));
     api.registerTool(() =>
       createVoiceListenTool({
@@ -43,6 +44,9 @@ const plugin = {
     );
     api.registerTool(() =>
       createVoiceSpeakTool({ getPipeline: getActivePipeline }),
+    );
+    api.registerTool(() =>
+      createVoiceTranscriptTool({ getPipeline: getActivePipeline }),
     );
 
     // CLI: `openclaw voice setup` / `openclaw voice models`

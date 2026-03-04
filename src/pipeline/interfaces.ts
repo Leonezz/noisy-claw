@@ -36,6 +36,7 @@ export interface AudioSource {
   stop(): void;
   onAudio(cb: (chunk: AudioChunk) => void): void;
   onVAD(cb: (speaking: boolean) => void): void;
+  onTopicShift?(cb: (similarity: number) => void): void;
 }
 
 export interface STTProvider {
@@ -50,6 +51,7 @@ export interface SegmentationEngine {
   onVAD(speaking: boolean): void;
   onMessage(cb: (message: string, metadata: SegmentMetadata) => void): void;
   flush(): string | null;
+  getBuffer?(): string;
 }
 
 export interface AudioOutput {

@@ -1,16 +1,19 @@
 import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk";
-import { getActivePipeline } from "./gateway.js";
+import { getActivePipeline, getActiveSession } from "./gateway.js";
 
 export const voiceOutboundAdapter: ChannelOutboundAdapter = {
   deliveryMode: "direct",
   textChunkLimit: 4000,
 
   sendText: async (ctx) => {
-    // Text is already delivered via the normal channel path.
-    // Additionally, synthesize and play audio.
-    const pipeline = getActivePipeline();
-    if (pipeline) {
-      pipeline.speak(ctx.text);
+    // Only synthesize TTS in conversation mode
+    const session = getActiveSession();
+    const mode = session?.getState().mode ?? "conversation";
+    if (mode === "conversation") {
+      const pipeline = getActivePipeline();
+      if (pipeline) {
+        pipeline.speak(ctx.text);
+      }
     }
 
     return {
@@ -20,8 +23,9 @@ export const voiceOutboundAdapter: ChannelOutboundAdapter = {
   },
 
   sendMedia: async (ctx) => {
-    // Voice channel doesn't support media — just read the text caption
-    if (ctx.text) {
+    const session = getActiveSession();
+    const mode = session?.getState().mode ?? "conversation";
+    if (ctx.text && mode === "conversation") {
       const pipeline = getActivePipeline();
       if (pipeline) {
         pipeline.speak(ctx.text);

@@ -58,6 +58,9 @@ pub enum Command {
         path: String,
     },
     StopPlayback,
+    SetMode {
+        mode: String,
+    },
     GetStatus,
     Shutdown,
 }
@@ -93,6 +96,9 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         request_id: Option<String>,
         reason: String,
+    },
+    TopicShift {
+        similarity: f64,
     },
     PlaybackDone,
     Status {
@@ -203,6 +209,16 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_set_mode() {
+        let json = r#"{"cmd":"set_mode","mode":"meeting"}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::SetMode { mode } => assert_eq!(mode, "meeting"),
+            _ => panic!("expected SetMode"),
+        }
+    }
+
+    #[test]
     fn deserialize_get_status() {
         let json = r#"{"cmd":"get_status"}"#;
         let cmd: Command = serde_json::from_str(json).unwrap();
@@ -268,6 +284,14 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["confidence"], 0.95);
+    }
+
+    #[test]
+    fn serialize_topic_shift() {
+        let json = serde_json::to_string(&Event::TopicShift { similarity: 0.42 }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "topic_shift");
+        assert!((v["similarity"].as_f64().unwrap() - 0.42).abs() < 0.001);
     }
 
     #[test]
@@ -353,6 +377,7 @@ mod tests {
             r#"{"cmd":"flush_speak","request_id":"req-001"}"#,
             r#"{"cmd":"play_audio","path":"/tmp/test.mp3"}"#,
             r#"{"cmd":"stop_playback"}"#,
+            r#"{"cmd":"set_mode","mode":"meeting"}"#,
             r#"{"cmd":"get_status"}"#,
             r#"{"cmd":"shutdown"}"#,
         ];
@@ -377,6 +402,7 @@ mod tests {
             },
             Event::SpeakStarted { request_id: Some("req-001".to_string()) },
             Event::SpeakDone { request_id: None, reason: "completed".to_string() },
+            Event::TopicShift { similarity: 0.42 },
             Event::PlaybackDone,
             Event::Status { capturing: false, playing: true, speaking: false },
             Event::Error { message: "fail".to_string() },

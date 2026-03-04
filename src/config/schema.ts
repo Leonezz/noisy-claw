@@ -2,7 +2,7 @@ import { z } from "zod";
 
 export const VoiceConfigSchema = z.object({
   enabled: z.boolean().optional(),
-  mode: z.enum(["conversation", "listen", "dictation"]).optional(),
+  mode: z.enum(["conversation", "meeting", "dictation"]).optional(),
   audio: z
     .object({
       source: z.enum(["mic"]).optional(),
@@ -38,6 +38,20 @@ export const VoiceConfigSchema = z.object({
     .object({
       endOfTurnSilence: z.number().optional(),
       interruptible: z.boolean().optional(),
+    })
+    .optional(),
+  meeting: z
+    .object({
+      topicShiftThreshold: z.number().optional(),
+      maxBlockDurationSec: z.number().optional(),
+      silenceBlockMs: z.number().optional(),
+      autoStopSilenceMs: z.number().optional(),
+      agentKeywords: z.array(z.string()).optional(),
+    })
+    .optional(),
+  dictation: z
+    .object({
+      endPhrases: z.array(z.string()).optional(),
     })
     .optional(),
 });

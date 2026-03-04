@@ -2,6 +2,7 @@ mod aec;
 mod audio_utils;
 mod capture;
 mod cloud;
+mod embedding;
 mod output;
 mod pipeline;
 mod playback;
@@ -39,10 +40,15 @@ async fn main() -> Result<()> {
     let dump_enabled = pipeline::dump::init();
     tracing::info!(dump_enabled, "audio dump");
 
-    // ── IPC event channel → stdout writer ──────────────────────────────
+    // ── IPC event channel → stdout writer + transcript tap ─────────────
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
+    let (transcript_tap_tx, mut transcript_tap_rx) = mpsc::channel::<String>(64);
     tokio::spawn(async move {
         while let Some(event) = event_rx.recv().await {
+            // Tap final transcripts for topic detection
+            if let Event::Transcript { ref text, is_final: true, .. } = event {
+                let _ = transcript_tap_tx.try_send(text.clone());
+            }
             if let Ok(json) = serde_json::to_string(&event) {
                 let stdout = std::io::stdout();
                 let mut stdout = stdout.lock();
@@ -111,6 +117,8 @@ async fn main() -> Result<()> {
     // ── Orchestrator state ─────────────────────────────────────────────
     let mut is_speaking_tts = false;
     let mut active_request_id: Option<String> = None;
+    let mut current_mode: String = "conversation".to_string();
+    let mut topic_handle: Option<pipeline::topic::Handle> = None;
 
     // ── Ready ──────────────────────────────────────────────────────────
     event_tx.send(Event::Ready).await?;
@@ -148,6 +156,8 @@ async fn main() -> Result<()> {
                             &models_dir,
                             &mut is_speaking_tts,
                             &mut active_request_id,
+                            &mut current_mode,
+                            &mut topic_handle,
                         ).await;
                         if should_exit {
                             break;
@@ -212,6 +222,17 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // ── Transcript tap → topic node (meeting mode only) ────────
+            Some(text) = transcript_tap_rx.recv() => {
+                if current_mode == "meeting" {
+                    if let Some(ref handle) = topic_handle {
+                        let _ = handle.control_tx.try_send(
+                            pipeline::topic::Control::Transcript { text },
+                        );
+                    }
+                }
+            }
+
             // ── Output node signals speak done ─────────────────────────
             Some(internal_event) = internal_rx.recv() => {
                 match internal_event {
@@ -263,6 +284,8 @@ async fn handle_command(
     models_dir: &PathBuf,
     is_speaking_tts: &mut bool,
     active_request_id: &mut Option<String>,
+    current_mode: &mut String,
+    topic_handle: &mut Option<pipeline::topic::Handle>,
 ) -> bool {
     tracing::info!(?cmd, "orchestrator: command received");
 
@@ -445,6 +468,44 @@ async fn handle_command(
             tracing::info!("orchestrator: playback stopped");
         }
 
+        Command::SetMode { mode } => {
+            tracing::info!(%mode, "orchestrator: mode set");
+
+            // Spawn topic node when entering meeting mode
+            if mode == "meeting" && topic_handle.is_none() {
+                let model_path = models_dir.join("multilingual-MiniLM-L12-v2.onnx");
+                let tokenizer_path = models_dir.join("multilingual-MiniLM-L12-v2-tokenizer.json");
+                if model_path.exists() && tokenizer_path.exists() {
+                    let handle = pipeline::topic::spawn(
+                        event_tx.clone(),
+                        model_path,
+                        tokenizer_path,
+                        0.65,   // similarity threshold
+                        300.0,  // max block secs
+                        30.0,   // silence block secs
+                    );
+                    *topic_handle = Some(handle);
+                    tracing::info!("orchestrator: topic detection node spawned");
+                } else {
+                    tracing::warn!(
+                        model = %model_path.display(),
+                        tokenizer = %tokenizer_path.display(),
+                        "orchestrator: embedding models not found, topic detection disabled"
+                    );
+                }
+            }
+
+            // Shutdown topic node when leaving meeting mode
+            if mode != "meeting" {
+                if let Some(handle) = topic_handle.take() {
+                    tokio::spawn(async move { handle.shutdown().await });
+                    tracing::info!("orchestrator: topic detection node shut down");
+                }
+            }
+
+            *current_mode = mode;
+        }
+
         Command::GetStatus => {
             let _ = event_tx
                 .send(Event::Status {
@@ -461,6 +522,9 @@ async fn handle_command(
             capture_handle.stop().await;
             stt_handle.stop().await;
             tts_handle.stop().await;
+            if let Some(handle) = topic_handle.take() {
+                handle.shutdown().await;
+            }
             if let Some(ref mut pb) = playback_engine {
                 pb.stop();
             }

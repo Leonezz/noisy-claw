@@ -40,6 +40,22 @@ export const MODEL_CATALOG: readonly ModelEntry[] = [
     description: "Whisper small (~466MB, better accuracy)",
     required: false,
   },
+  {
+    id: "multilingual-minilm-onnx",
+    filename: "multilingual-MiniLM-L12-v2.onnx",
+    url: "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/onnx/model.onnx",
+    sizeBytes: 91_000_000,
+    description: "Multilingual MiniLM-L12 v2 sentence embeddings (topic detection)",
+    required: false,
+  },
+  {
+    id: "multilingual-minilm-tokenizer",
+    filename: "multilingual-MiniLM-L12-v2-tokenizer.json",
+    url: "https://huggingface.co/sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2/resolve/main/tokenizer.json",
+    sizeBytes: 1_800_000,
+    description: "Tokenizer for multilingual MiniLM-L12 v2",
+    required: false,
+  },
 ];
 
 export const DEFAULT_STT_MODEL_ID = "whisper-base";

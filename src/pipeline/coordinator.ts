@@ -32,6 +32,7 @@ const SENTENCE_BOUNDARY = /[。！？.!?\n]/;
 
 export class PipelineCoordinator {
   private readonly components: PipelineComponents;
+  private currentSegmentation: SegmentationEngine;
   private messageCallbacks: Array<(message: string, metadata: SegmentMetadata) => void> = [];
   private active = false;
   private paused = false;
@@ -42,32 +43,30 @@ export class PipelineCoordinator {
 
   constructor(components: PipelineComponents) {
     this.components = components;
+    this.currentSegmentation = components.segmentation;
     this.wireComponents();
   }
 
   private wireComponents(): void {
-    const { audioSource, sttProvider, segmentation, audioOutput } = this.components;
+    const { audioSource, sttProvider, audioOutput } = this.components;
 
-    // AudioSource VAD -> SegmentationEngine
-    // Barge-in is now handled entirely in Rust (VAD node detects speech
-    // during TTS and sends barge-in signal to orchestrator).
+    // AudioSource VAD -> current SegmentationEngine (via indirection)
     audioSource.onVAD((speaking) => {
-      segmentation.onVAD(speaking);
+      this.currentSegmentation.onVAD(speaking);
     });
 
     // AudioSource audio chunks -> STTProvider
-    // Echo cancellation and VAD gating are handled in Rust, so we always feed.
     audioSource.onAudio((chunk) => {
       sttProvider.feed(chunk);
     });
 
-    // STTProvider transcripts -> SegmentationEngine
+    // STTProvider transcripts -> current SegmentationEngine (via indirection)
     sttProvider.onTranscript((segment) => {
-      segmentation.onTranscript(segment);
+      this.currentSegmentation.onTranscript(segment);
     });
 
-    // SegmentationEngine messages -> callbacks
-    segmentation.onMessage((message, metadata) => {
+    // Wire initial segmentation's message callback
+    this.currentSegmentation.onMessage((message, metadata) => {
       for (const cb of this.messageCallbacks) {
         cb(message, metadata);
       }
@@ -78,6 +77,28 @@ export class PipelineCoordinator {
       console.log(`[noisy-claw] audioOutput.onDone: requestId=${requestId} reason=${reason}`);
       this.activeRequestId = null;
     });
+  }
+
+  swapSegmentation(engine: SegmentationEngine): void {
+    this.currentSegmentation.flush();
+    this.currentSegmentation = engine;
+    engine.onMessage((msg, meta) => {
+      for (const cb of this.messageCallbacks) {
+        cb(msg, meta);
+      }
+    });
+  }
+
+  getAudioSource(): PipelineComponents["audioSource"] {
+    return this.components.audioSource;
+  }
+
+  getTranscriptBuffer(): string {
+    return this.currentSegmentation.getBuffer?.() ?? "";
+  }
+
+  flushTranscript(): string | null {
+    return this.currentSegmentation.flush();
   }
 
   start(config: PipelineConfig): void {

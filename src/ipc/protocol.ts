@@ -77,6 +77,11 @@ export type GetStatusCommand = {
   cmd: "get_status";
 };
 
+export type SetModeCommand = {
+  cmd: "set_mode";
+  mode: string;
+};
+
 export type ShutdownCommand = {
   cmd: "shutdown";
 };
@@ -92,6 +97,7 @@ export type Command =
   | FlushSpeakCommand
   | PlayAudioCommand
   | StopPlaybackCommand
+  | SetModeCommand
   | GetStatusCommand
   | ShutdownCommand;
 
@@ -136,6 +142,11 @@ export type StatusEvent = {
   speaking: boolean;
 };
 
+export type TopicShiftEvent = {
+  event: "topic_shift";
+  similarity: number;
+};
+
 export type ErrorEvent = {
   event: "error";
   message: string;
@@ -147,6 +158,7 @@ export type AudioEvent =
   | TranscriptEvent
   | SpeakStartedEvent
   | SpeakDoneEvent
+  | TopicShiftEvent
   | PlaybackDoneEvent
   | StatusEvent
   | ErrorEvent;
