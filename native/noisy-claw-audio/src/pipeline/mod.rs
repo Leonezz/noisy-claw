@@ -1,6 +1,7 @@
 pub mod aec;
 pub mod capture;
 pub mod dump;
+pub mod graph;
 pub mod output;
 pub mod stt;
 pub mod tap;

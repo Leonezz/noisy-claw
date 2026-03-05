@@ -39,6 +39,9 @@ ringbuf = "0.4"
 # Sentence embeddings (topic detection)
 tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
+# Node auto-registration
+inventory = "0.3"
+
 # Utilities
 anyhow = "1"
 base64 = "0.22"
