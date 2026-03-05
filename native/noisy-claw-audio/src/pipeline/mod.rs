@@ -73,6 +73,7 @@ pub struct VadState {
 }
 
 /// VAD state transition emitted by the VAD node.
+#[derive(Clone)]
 pub struct VadEvent {
     pub speaking: bool,
 }
@@ -83,6 +84,7 @@ pub enum OutputNodeEvent {
 }
 
 /// Messages sent to the output node (from TTS node and orchestrator).
+#[derive(Clone)]
 pub enum OutputMessage {
     /// Begin a new playback session at the given sample rate.
     StartSession { request_id: RequestId, sample_rate: u32 },

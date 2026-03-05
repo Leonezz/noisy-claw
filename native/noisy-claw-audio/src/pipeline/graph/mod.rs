@@ -1,6 +1,7 @@
 pub mod builder;
 pub mod definition;
 pub mod node;
+pub mod nodes;
 pub mod pipeline;
 pub mod registry;
 pub mod types;

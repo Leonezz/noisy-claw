@@ -1,3 +1,5 @@
+use std::any::Any;
+
 use anyhow::Result;
 use tokio::sync::mpsc;
 
@@ -57,4 +59,8 @@ pub trait PipelineNode: NodeWiring + Send + 'static {
 
     /// Graceful shutdown — stop processing and release resources.
     async fn shutdown(&mut self);
+
+    /// Downcast support for accessing concrete node types.
+    fn as_any(&self) -> &dyn Any;
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }

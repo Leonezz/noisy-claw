@@ -1,11 +1,33 @@
+use std::any::Any;
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
+use tokio::sync::oneshot;
 
 use super::builder::PipelineBuilder;
 use super::definition::PipelineDefinition;
 use super::node::{NodeHandle, PipelineNode};
 use super::types::{NodeSnapshot, PropertyMap};
+
+/// Request sent from the tap server (or other introspection clients) to the orchestrator.
+pub enum PipelineRequest {
+    GetSnapshot {
+        reply: oneshot::Sender<PipelineSnapshot>,
+    },
+    GetDefinition {
+        reply: oneshot::Sender<PipelineDefinition>,
+    },
+    SetProperty {
+        node: String,
+        key: String,
+        value: serde_json::Value,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    SetMode {
+        mode: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
 
 /// Snapshot of the entire pipeline for introspection / visualization.
 #[derive(Clone, Debug, serde::Serialize)]
@@ -113,5 +135,15 @@ impl Pipeline {
     /// Get a mutable reference to a node by name.
     pub fn node_mut(&mut self, name: &str) -> Option<&mut Box<dyn PipelineNode>> {
         self.nodes.get_mut(name)
+    }
+
+    /// Downcast a node to a concrete type by name.
+    pub fn downcast_node<T: Any>(&self, name: &str) -> Option<&T> {
+        self.nodes.get(name)?.as_any().downcast_ref()
+    }
+
+    /// Downcast a node to a concrete type by name (mutable).
+    pub fn downcast_node_mut<T: Any>(&mut self, name: &str) -> Option<&mut T> {
+        self.nodes.get_mut(name)?.as_any_mut().downcast_mut()
     }
 }

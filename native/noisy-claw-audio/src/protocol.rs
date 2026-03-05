@@ -76,7 +76,7 @@ fn default_sample_rate() -> u32 {
     PIPELINE_SAMPLE_RATE
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Clone, Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum Event {
     Ready,

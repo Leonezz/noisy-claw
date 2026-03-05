@@ -48,7 +48,7 @@ mod tests {
     #[test]
     fn registry_iter_returns_submitted_entries() {
         let count = NodeRegistry::iter().count();
-        assert!(count == 0 || count > 0);
+        assert!(count >= 8, "expected at least 8 registered nodes, got {count}");
     }
 
     #[test]
@@ -59,6 +59,23 @@ mod tests {
     #[test]
     fn registry_node_types_returns_vec() {
         let types = NodeRegistry::node_types();
-        assert!(types.len() == 0 || types.len() > 0);
+        assert!(types.len() >= 8, "expected at least 8 node types, got {}", types.len());
+    }
+
+    #[test]
+    fn registry_finds_all_pipeline_nodes() {
+        let expected = ["capture", "aec", "vad", "stt", "tts", "output", "topic", "ipc_sink"];
+        for name in expected {
+            assert!(
+                NodeRegistry::find(name).is_some(),
+                "node type '{name}' not found in registry"
+            );
+        }
+    }
+
+    #[test]
+    fn registry_factory_creates_node() {
+        let node = NodeRegistry::create("capture", &serde_json::json!({}));
+        assert!(node.is_ok(), "failed to create capture node: {:?}", node.err());
     }
 }

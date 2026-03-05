@@ -16,12 +16,65 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::mpsc;
+
+use pipeline::graph::nodes::capture_node::CaptureNode;
+use pipeline::graph::nodes::ipc_sink_node::IpcSinkNode;
+use pipeline::graph::nodes::output_node::OutputNode;
+use pipeline::graph::nodes::stt_node::SttNode;
+use pipeline::graph::nodes::tts_node::TtsNode;
+use pipeline::graph::nodes::vad_node::VadNode;
+use pipeline::graph::pipeline::PipelineRequest;
+use pipeline::graph::Pipeline;
 
 static REQUEST_COUNTER: AtomicU64 = AtomicU64::new(0);
 fn next_request_id() -> String {
     let n = REQUEST_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     format!("req-{n:06}")
+}
+
+fn pipeline_definition_json(models_dir: &PathBuf) -> String {
+    let vad_model = models_dir.join("silero_vad.onnx").display().to_string();
+
+    // Note: the topic node is NOT included here — it's spawned on demand
+    // when entering meeting mode, since it requires optional model files.
+    serde_json::json!({
+        "name": "noisy-claw",
+        "nodes": [
+            { "name": "capture", "type": "capture", "properties": { "device": "default", "sample_rate": 48000 } },
+            { "name": "aec",      "type": "aec",      "properties": {} },
+            { "name": "vad",      "type": "vad",      "properties": { "model_path": vad_model, "threshold": 0.5 } },
+            { "name": "stt",      "type": "stt",      "properties": {} },
+            { "name": "tts",      "type": "tts",      "properties": {} },
+            { "name": "output",   "type": "output",   "properties": {} },
+            { "name": "ipc_sink", "type": "ipc_sink", "properties": {} },
+        ],
+        "links": [
+            // Audio pipeline: capture → aec → vad → stt
+            { "from": "capture:audio_out",     "to": "aec:capture_in" },
+            { "from": "output:render_ref_out", "to": "aec:render_in" },
+            { "from": "aec:audio_out",         "to": "vad:audio_in" },
+            { "from": "vad:audio_out",         "to": "stt:audio_in" },
+            { "from": "vad:vad_event_out",     "to": "stt:vad_in" },
+            // TTS → output
+            { "from": "tts:output_msg_out",    "to": "output:output_msg_in" },
+            // IPC events → ipc_sink (fan-in from all event-producing nodes)
+            { "from": "vad:ipc_event_out",     "to": "ipc_sink:event_in" },
+            { "from": "stt:ipc_event_out",     "to": "ipc_sink:event_in" },
+            { "from": "tts:ipc_event_out",     "to": "ipc_sink:event_in" },
+        ],
+        "modes": {
+            "conversation": {
+                "vad": { "threshold": 0.5 }
+            },
+            "meeting": {
+                "vad": { "threshold": 0.3 }
+            },
+            "dictation": {
+                "vad": { "threshold": 0.3 }
+            }
+        }
+    }).to_string()
 }
 
 #[tokio::main]
@@ -40,82 +93,42 @@ async fn main() -> Result<()> {
     let dump_enabled = pipeline::dump::init();
     tracing::info!(dump_enabled, "audio dump");
 
+    // ── Pipeline introspection channel ─────────────────────────────────
+    let (introspect_tx, mut introspect_rx) = mpsc::channel::<PipelineRequest>(32);
+
     // ── WebSocket audio tap server (opt-in via AUDIO_TAP_PORT env var) ──
     if let Ok(port_str) = std::env::var("AUDIO_TAP_PORT") {
         let port: u16 = port_str.parse().unwrap_or(9876);
         let dump_base = pipeline::dump::dump_base_dir();
-        pipeline::tap::spawn_server(port, dump_base);
+        pipeline::tap::spawn_server(port, dump_base, introspect_tx.clone());
     }
 
-    // ── IPC event channel → stdout writer + transcript tap ─────────────
-    let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
-    let (transcript_tap_tx, mut transcript_tap_rx) = mpsc::channel::<String>(64);
-    tokio::spawn(async move {
-        while let Some(event) = event_rx.recv().await {
-            // Tap final transcripts for topic detection
-            if let Event::Transcript { ref text, is_final: true, .. } = event {
-                let _ = transcript_tap_tx.try_send(text.clone());
-            }
-            if let Ok(json) = serde_json::to_string(&event) {
-                let stdout = std::io::stdout();
-                let mut stdout = stdout.lock();
-                let _ = writeln!(stdout, "{}", json);
-                let _ = stdout.flush();
-            }
-        }
-    });
-
-    // ── Pipeline-wide state ────────────────────────────────────────────
-    let (tts_speaking_tx, tts_speaking_rx) = watch::channel(false);
-
-    // ── Data channels between nodes ────────────────────────────────────
-    let (capture_tx, capture_rx) = mpsc::unbounded_channel();     // capture → aec
-    let (render_ref_tx, render_ref_rx) = mpsc::unbounded_channel(); // output → aec
-    let (cleaned_tx, cleaned_rx) = mpsc::unbounded_channel();     // aec → vad
-    let (vad_audio_tx, vad_audio_rx) = mpsc::unbounded_channel(); // vad → stt (passthrough)
-    let (vad_event_tx, vad_event_rx) = mpsc::channel(64);        // vad → stt
-    let (output_msg_tx, output_msg_rx) = mpsc::channel(64);      // tts → output
-    let (internal_tx, mut internal_rx) = mpsc::channel(16);       // output → orchestrator
-    let (barge_in_tx, mut barge_in_rx) = mpsc::channel::<()>(4);  // vad → orchestrator (barge-in)
-
-    // ── Spawn pipeline nodes ───────────────────────────────────────────
+    // ── Build and start the pipeline from JSON definition ────────────
     let models_dir = resolve_models_dir();
+    tracing::info!(models_dir = %models_dir.display(), "orchestrator: building pipeline");
 
-    tracing::info!(models_dir = %models_dir.display(), "orchestrator: spawning pipeline nodes");
+    let json = pipeline_definition_json(&models_dir);
+    let mut pipe = Pipeline::from_json(&json)?;
+    pipe.start().await?;
 
-    let capture_handle = pipeline::capture::spawn(capture_tx);
-    tracing::info!("orchestrator: capture node spawned");
+    tracing::info!("orchestrator: pipeline started");
 
-    let aec_handle = pipeline::aec::spawn(capture_rx, render_ref_rx, cleaned_tx);
-    tracing::info!("orchestrator: AEC node spawned");
+    // ── Extract orchestrator-facing handles via downcast ──────────────
+    let event_tx = pipe.downcast_node_mut::<IpcSinkNode>("ipc_sink")
+        .and_then(|n| n.take_event_tx())
+        .expect("ipc_sink event_tx");
 
-    let vad_handle = pipeline::vad::spawn(
-        cleaned_rx,
-        vad_audio_tx,
-        vad_event_tx,
-        event_tx.clone(),
-        barge_in_tx,
-        tts_speaking_rx.clone(),
-        models_dir.join("silero_vad.onnx"),
-        0.5,
-    );
-    tracing::info!(
-        vad_initialized = vad_handle.is_initialized(),
-        "orchestrator: VAD node spawned"
-    );
+    let mut transcript_tap_rx = pipe.downcast_node_mut::<IpcSinkNode>("ipc_sink")
+        .and_then(|n| n.take_transcript_tap_rx())
+        .expect("ipc_sink transcript_tap_rx");
 
-    let stt_handle = pipeline::stt::spawn(
-        vad_audio_rx,
-        vad_event_rx,
-        event_tx.clone(),
-    );
-    tracing::info!("orchestrator: STT node spawned");
+    let mut barge_in_rx = pipe.downcast_node_mut::<VadNode>("vad")
+        .and_then(|n| n.take_barge_in_rx())
+        .expect("vad barge_in_rx");
 
-    let tts_handle = pipeline::tts::spawn(output_msg_tx.clone(), event_tx.clone());
-    tracing::info!("orchestrator: TTS node spawned");
-
-    let output_handle = pipeline::output::spawn(output_msg_rx, render_ref_tx, internal_tx);
-    tracing::info!("orchestrator: output node spawned — pipeline ready");
+    let mut internal_rx = pipe.downcast_node_mut::<OutputNode>("output")
+        .and_then(|n| n.take_speak_done_rx())
+        .expect("output speak_done_rx");
 
     // ── File-based playback (not part of the pipeline) ─────────────────
     let mut playback_engine: Option<playback::AudioPlayback> = None;
@@ -130,7 +143,7 @@ async fn main() -> Result<()> {
     // ── Ready ──────────────────────────────────────────────────────────
     event_tx.send(Event::Ready).await?;
 
-    // ── IPC command loop ───────────────────────────────────────────────
+    // ── IPC command loop ─────────────────────────────────────────────
     let stdin = BufReader::new(tokio::io::stdin());
     let mut lines = stdin.lines();
 
@@ -150,15 +163,9 @@ async fn main() -> Result<()> {
                     Ok(cmd) => {
                         let should_exit = handle_command(
                             cmd,
-                            &capture_handle,
-                            &vad_handle,
-                            &stt_handle,
-                            &tts_handle,
-                            &output_handle,
-                            &output_msg_tx,
+                            &mut pipe,
                             &mut playback_engine,
                             &mut playback_done_rx,
-                            &tts_speaking_tx,
                             &event_tx,
                             &models_dir,
                             &mut is_speaking_tts,
@@ -193,34 +200,17 @@ async fn main() -> Result<()> {
                 let _ = event_tx.send(Event::PlaybackDone).await;
             }
 
-            // ── VAD barge-in: immediate flush cascade ────────────────
+            // ── VAD barge-in: immediate flush cascade ──────────────────
             Some(()) = barge_in_rx.recv() => {
                 if is_speaking_tts {
                     let req_id = active_request_id.take().unwrap_or_default();
                     tracing::info!(%req_id, "orchestrator: barge-in confirmed, flushing");
 
-                    // Full flush cascade
-                    let tts_ack = tts_handle.flush(pipeline::FlushSignal::Flush {
-                        request_id: req_id.clone(),
-                    }).await;
-                    tracing::info!(node = ?tts_ack.node, "orchestrator: TTS flush ack");
-
-                    let out_ack = output_handle.flush(pipeline::FlushSignal::Flush {
-                        request_id: req_id.clone(),
-                    }).await;
-                    tracing::info!(node = ?out_ack.node, "orchestrator: Output flush ack");
+                    flush_speak(&mut pipe, &req_id).await;
 
                     is_speaking_tts = false;
-                    tts_speaking_tx.send_replace(false);
-
-                    // Keep threshold at 0.85 briefly and apply post-flush
-                    // blanking so residual speaker audio doesn't re-trigger
-                    // barge-in. The blanking countdown will expire, then
-                    // normal-mode VAD (threshold 0.5) resumes naturally
-                    // when speaking_tts becomes false.
-                    vad_handle.post_flush_blanking().await;
-
-                    vad_handle.reset().await;
+                    set_speaking_tts(&mut pipe, false);
+                    post_flush_vad_reset(&mut pipe).await;
 
                     let _ = event_tx.send(Event::SpeakDone {
                         request_id: Some(req_id),
@@ -240,6 +230,11 @@ async fn main() -> Result<()> {
                 }
             }
 
+            // ── Pipeline introspection requests (from tap server) ────────
+            Some(req) = introspect_rx.recv() => {
+                handle_introspect_request(req, &mut pipe);
+            }
+
             // ── Output node signals speak done ─────────────────────────
             Some(internal_event) = internal_rx.recv() => {
                 match internal_event {
@@ -248,10 +243,9 @@ async fn main() -> Result<()> {
                         if is_speaking_tts {
                             let req_id = active_request_id.take();
                             is_speaking_tts = false;
-                            tts_speaking_tx.send_replace(false);
-                            vad_handle.post_flush_blanking().await;
-        
-                            vad_handle.reset().await;
+                            set_speaking_tts(&mut pipe, false);
+                            post_flush_vad_reset(&mut pipe).await;
+
                             let _ = event_tx.send(Event::SpeakDone {
                                 request_id: req_id,
                                 reason: "completed".to_string(),
@@ -265,28 +259,68 @@ async fn main() -> Result<()> {
 
     // ── Shutdown ───────────────────────────────────────────────────────
     pipeline::dump::finish();
-    capture_handle.shutdown().await;
-    aec_handle.shutdown().await;
-    vad_handle.shutdown().await;
-    stt_handle.shutdown().await;
-    tts_handle.shutdown().await;
-    output_handle.shutdown().await;
+    pipe.shutdown().await;
 
     Ok(())
+}
+
+/// Handle introspection requests from the tap server.
+fn handle_introspect_request(req: PipelineRequest, pipe: &mut Pipeline) {
+    match req {
+        PipelineRequest::GetSnapshot { reply } => {
+            let _ = reply.send(pipe.snapshot());
+        }
+        PipelineRequest::GetDefinition { reply } => {
+            let _ = reply.send(pipe.definition().clone());
+        }
+        PipelineRequest::SetProperty { node, key, value, reply } => {
+            let _ = reply.send(pipe.set_property(&node, &key, value));
+        }
+        PipelineRequest::SetMode { mode, reply } => {
+            let _ = reply.send(pipe.set_mode(&mode));
+        }
+    }
+}
+
+/// Set VAD's speaking_tts state via the pipeline graph.
+fn set_speaking_tts(pipe: &mut Pipeline, speaking: bool) {
+    if let Some(vad_node) = pipe.downcast_node::<VadNode>("vad") {
+        let _ = vad_node.speaking_tts_tx().send(speaking);
+    }
+}
+
+/// Flush TTS and output nodes for a specific request.
+async fn flush_speak(pipe: &mut Pipeline, req_id: &str) {
+    if let Some(tts) = pipe.node_mut("tts") {
+        let tts_ack = tts.flush(pipeline::FlushSignal::Flush {
+            request_id: req_id.to_string(),
+        }).await;
+        tracing::info!(node = ?tts_ack.node, "orchestrator: TTS flush ack");
+    }
+    if let Some(out) = pipe.node_mut("output") {
+        let out_ack = out.flush(pipeline::FlushSignal::Flush {
+            request_id: req_id.to_string(),
+        }).await;
+        tracing::info!(node = ?out_ack.node, "orchestrator: Output flush ack");
+    }
+}
+
+/// Post-flush VAD blanking and reset.
+async fn post_flush_vad_reset(pipe: &mut Pipeline) {
+    if let Some(vad_node) = pipe.downcast_node::<VadNode>("vad") {
+        if let Some(h) = vad_node.inner() {
+            h.post_flush_blanking().await;
+            h.reset().await;
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_command(
     cmd: Command,
-    capture_handle: &pipeline::capture::Handle,
-    vad_handle: &pipeline::vad::Handle,
-    stt_handle: &pipeline::stt::Handle,
-    tts_handle: &pipeline::tts::Handle,
-    output_handle: &pipeline::output::Handle,
-    output_msg_tx: &mpsc::Sender<pipeline::OutputMessage>,
+    pipe: &mut Pipeline,
     playback_engine: &mut Option<playback::AudioPlayback>,
     playback_done_rx: &mut Option<tokio::sync::oneshot::Receiver<()>>,
-    tts_speaking_tx: &watch::Sender<bool>,
     event_tx: &mpsc::Sender<Event>,
     models_dir: &PathBuf,
     is_speaking_tts: &mut bool,
@@ -302,8 +336,6 @@ async fn handle_command(
             sample_rate,
             stt,
         } => {
-            // Pipeline always runs at PIPELINE_SAMPLE_RATE (48kHz).
-            // Ignore sample_rate from TS — it may carry stale user config values.
             let pipeline_rate = protocol::PIPELINE_SAMPLE_RATE;
             if sample_rate != pipeline_rate {
                 tracing::warn!(
@@ -314,7 +346,10 @@ async fn handle_command(
             }
 
             // Check VAD initialization
-            if !vad_handle.is_initialized() {
+            let vad_ok = pipe.downcast_node::<VadNode>("vad")
+                .and_then(|n| n.inner())
+                .map_or(false, |h| h.is_initialized());
+            if !vad_ok {
                 tracing::error!("orchestrator: VAD not initialized, rejecting StartCapture");
                 let _ = event_tx.send(Event::Error {
                     message: "VAD init failed: model not available".to_string(),
@@ -334,83 +369,97 @@ async fn handle_command(
                 "orchestrator: starting capture pipeline"
             );
 
-            if stt_provider == "whisper" {
-                let stt_filename = std::env::var("NOISY_CLAW_STT_MODEL")
-                    .unwrap_or_else(|_| "ggml-base.bin".to_string());
-                tracing::info!(%stt_filename, "orchestrator: starting local Whisper STT");
-                stt_handle
-                    .start_local(models_dir.join(&stt_filename), "en".to_string())
-                    .await;
-            } else if let Some(stt_config) = stt {
-                tracing::info!(stt_provider = %stt_provider_str, "orchestrator: starting cloud STT");
-                stt_handle.start_cloud(stt_config).await;
+            if let Some(stt_node) = pipe.downcast_node::<SttNode>("stt") {
+                if let Some(stt_handle) = stt_node.inner() {
+                    if stt_provider == "whisper" {
+                        let stt_filename = std::env::var("NOISY_CLAW_STT_MODEL")
+                            .unwrap_or_else(|_| "ggml-base.bin".to_string());
+                        tracing::info!(%stt_filename, "orchestrator: starting local Whisper STT");
+                        stt_handle
+                            .start_local(models_dir.join(&stt_filename), "en".to_string())
+                            .await;
+                    } else if let Some(stt_config) = stt {
+                        tracing::info!(stt_provider = %stt_provider_str, "orchestrator: starting cloud STT");
+                        stt_handle.start_cloud(stt_config).await;
+                    }
+                }
             }
 
-            // Start capture at pipeline rate (48kHz)
-            capture_handle.start(&device, pipeline_rate).await;
-            tracing::info!(
-                %device, sample_rate = pipeline_rate,
-                is_capturing = capture_handle.is_capturing(),
-                "orchestrator: capture started"
-            );
+            // Start capture
+            if let Some(cap) = pipe.downcast_node::<CaptureNode>("capture") {
+                if let Some(h) = cap.inner() {
+                    h.start(&device, pipeline_rate).await;
+                    tracing::info!(
+                        %device, sample_rate = pipeline_rate,
+                        is_capturing = h.is_capturing(),
+                        "orchestrator: capture started"
+                    );
+                }
+            }
         }
 
         Command::StopCapture => {
-            capture_handle.stop().await;
-            stt_handle.stop().await;
-            tracing::info!(
-                is_capturing = capture_handle.is_capturing(),
-                "orchestrator: capture stopped"
-            );
+            if let Some(cap) = pipe.downcast_node::<CaptureNode>("capture") {
+                if let Some(h) = cap.inner() { h.stop().await; }
+            }
+            if let Some(stt_node) = pipe.downcast_node::<SttNode>("stt") {
+                if let Some(h) = stt_node.inner() { h.stop().await; }
+            }
+            tracing::info!("orchestrator: capture stopped");
         }
 
         Command::Speak { text, tts, request_id: cmd_req_id } => {
             let req_id = cmd_req_id.unwrap_or_else(next_request_id);
             *active_request_id = Some(req_id.clone());
             *is_speaking_tts = true;
-            tts_speaking_tx.send_replace(true);
-            vad_handle.set_threshold(0.85).await;
+            set_speaking_tts(pipe, true);
+            pipe.set_property("vad", "threshold", serde_json::json!(0.85)).ok();
             let _ = event_tx.send(Event::SpeakStarted {
                 request_id: Some(req_id.clone()),
             }).await;
 
-            tts_handle.speak(text, tts, pipeline::RequestId(req_id)).await;
+            if let Some(tts_node) = pipe.downcast_node::<TtsNode>("tts") {
+                if let Some(h) = tts_node.inner() {
+                    h.speak(text, tts, pipeline::RequestId(req_id)).await;
+                }
+            }
         }
 
         Command::SpeakStart { tts, request_id: cmd_req_id } => {
             let req_id = cmd_req_id.unwrap_or_else(next_request_id);
             *active_request_id = Some(req_id.clone());
             *is_speaking_tts = true;
-            tts_speaking_tx.send_replace(true);
-            vad_handle.set_threshold(0.85).await;
+            set_speaking_tts(pipe, true);
+            pipe.set_property("vad", "threshold", serde_json::json!(0.85)).ok();
             let _ = event_tx.send(Event::SpeakStarted {
                 request_id: Some(req_id.clone()),
             }).await;
 
-            tts_handle.speak_start(tts, pipeline::RequestId(req_id)).await;
+            if let Some(tts_node) = pipe.downcast_node::<TtsNode>("tts") {
+                if let Some(h) = tts_node.inner() {
+                    h.speak_start(tts, pipeline::RequestId(req_id)).await;
+                }
+            }
         }
 
         Command::SpeakChunk { text } => {
-            tts_handle.speak_chunk(text).await;
+            if let Some(tts_node) = pipe.downcast_node::<TtsNode>("tts") {
+                if let Some(h) = tts_node.inner() { h.speak_chunk(text).await; }
+            }
         }
 
         Command::SpeakEnd => {
-            tts_handle.speak_end().await;
-            // Output node will signal SpeakDone when buffer drains
+            if let Some(tts_node) = pipe.downcast_node::<TtsNode>("tts") {
+                if let Some(h) = tts_node.inner() { h.speak_end().await; }
+            }
         }
 
         Command::FlushSpeak { request_id } => {
             if *is_speaking_tts {
-                let _ = tts_handle.flush(pipeline::FlushSignal::Flush {
-                    request_id: request_id.clone(),
-                }).await;
-                let _ = output_handle.flush(pipeline::FlushSignal::Flush {
-                    request_id: request_id.clone(),
-                }).await;
+                flush_speak(pipe, &request_id).await;
                 *is_speaking_tts = false;
-                tts_speaking_tx.send_replace(false);
-                vad_handle.post_flush_blanking().await;
-                vad_handle.reset().await;
+                set_speaking_tts(pipe, false);
+                post_flush_vad_reset(pipe).await;
                 let _ = event_tx.send(Event::SpeakDone {
                     request_id: Some(request_id),
                     reason: "interrupted".to_string(),
@@ -422,14 +471,15 @@ async fn handle_command(
         Command::StopSpeaking => {
             if *is_speaking_tts {
                 let req_id = active_request_id.take();
-                // Flush cascade
-                let _ = tts_handle.flush(pipeline::FlushSignal::FlushAll).await;
-                let _ = output_handle.flush(pipeline::FlushSignal::FlushAll).await;
-                // Reset pipeline state
+                if let Some(tts_node) = pipe.node_mut("tts") {
+                    let _ = tts_node.flush(pipeline::FlushSignal::FlushAll).await;
+                }
+                if let Some(out_node) = pipe.node_mut("output") {
+                    let _ = out_node.flush(pipeline::FlushSignal::FlushAll).await;
+                }
                 *is_speaking_tts = false;
-                tts_speaking_tx.send_replace(false);
-                vad_handle.post_flush_blanking().await;
-                vad_handle.reset().await;
+                set_speaking_tts(pipe, false);
+                post_flush_vad_reset(pipe).await;
                 let _ = event_tx.send(Event::SpeakDone {
                     request_id: req_id,
                     reason: "stopped".to_string(),
@@ -525,9 +575,12 @@ async fn handle_command(
         }
 
         Command::GetStatus => {
+            let capturing = pipe.downcast_node::<CaptureNode>("capture")
+                .and_then(|n| n.inner())
+                .map_or(false, |h| h.is_capturing());
             let _ = event_tx
                 .send(Event::Status {
-                    capturing: capture_handle.is_capturing(),
+                    capturing,
                     playing: playback_engine
                         .as_ref()
                         .map_or(false, |p| p.is_playing()),
@@ -537,9 +590,16 @@ async fn handle_command(
         }
 
         Command::Shutdown => {
-            capture_handle.stop().await;
-            stt_handle.stop().await;
-            tts_handle.stop().await;
+            // Stop active sub-systems before full pipeline shutdown
+            if let Some(cap) = pipe.downcast_node::<CaptureNode>("capture") {
+                if let Some(h) = cap.inner() { h.stop().await; }
+            }
+            if let Some(stt_node) = pipe.downcast_node::<SttNode>("stt") {
+                if let Some(h) = stt_node.inner() { h.stop().await; }
+            }
+            if let Some(tts_node) = pipe.downcast_node::<TtsNode>("tts") {
+                if let Some(h) = tts_node.inner() { h.stop().await; }
+            }
             if let Some(handle) = topic_handle.take() {
                 handle.shutdown().await;
             }
@@ -595,5 +655,16 @@ mod tests {
         let path = resolve_models_dir();
         let name = path.file_name().unwrap().to_str().unwrap();
         assert_eq!(name, "models");
+    }
+
+    #[test]
+    fn pipeline_definition_parses() {
+        let models = PathBuf::from("models");
+        let json = pipeline_definition_json(&models);
+        let def: pipeline::graph::PipelineDefinition = serde_json::from_str(&json).unwrap();
+        assert_eq!(def.name, "noisy-claw");
+        assert_eq!(def.nodes.len(), 7); // topic node spawned on demand, not in graph
+        assert_eq!(def.links.len(), 9);
+        assert_eq!(def.modes.len(), 3);
     }
 }

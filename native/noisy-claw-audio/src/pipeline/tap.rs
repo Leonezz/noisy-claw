@@ -4,18 +4,24 @@ use std::path::PathBuf;
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::dump::{self, TapMessage};
+use super::graph::pipeline::PipelineRequest;
 
 /// Spawn the WebSocket audio tap server on the given port.
 ///
 /// Clients connect and send a JSON subscription message to select which taps
 /// to receive. The server then streams binary audio frames and text VAD metadata.
 ///
-/// Also serves dump directory listings and raw dump files over a simple HTTP-like
-/// protocol for the web UI to browse/play recorded audio.
-pub fn spawn_server(port: u16, dump_base: Option<PathBuf>) {
+/// Also serves dump directory listings, raw dump files, and pipeline
+/// introspection (get_pipeline, subscribe_snapshots, set_property, set_mode).
+pub fn spawn_server(
+    port: u16,
+    dump_base: Option<PathBuf>,
+    pipeline_tx: mpsc::Sender<PipelineRequest>,
+) {
     tokio::spawn(async move {
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let listener = match TcpListener::bind(&addr).await {
@@ -31,8 +37,9 @@ pub fn spawn_server(port: u16, dump_base: Option<PathBuf>) {
             match listener.accept().await {
                 Ok((stream, peer)) => {
                     let dump_base = dump_base.clone();
+                    let pipeline_tx = pipeline_tx.clone();
                     tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, peer, dump_base).await {
+                        if let Err(e) = handle_connection(stream, peer, dump_base, pipeline_tx).await {
                             tracing::debug!(%e, %peer, "tap server: connection ended");
                         }
                     });
@@ -49,6 +56,7 @@ async fn handle_connection(
     stream: TcpStream,
     peer: SocketAddr,
     dump_base: Option<PathBuf>,
+    pipeline_tx: mpsc::Sender<PipelineRequest>,
 ) -> anyhow::Result<()> {
     let ws_stream = tokio_tungstenite::accept_async(stream).await?;
     tracing::info!(%peer, "tap server: client connected");
@@ -61,6 +69,9 @@ async fn handle_connection(
     let mut tap_rx = dump::tap_subscribe()
         .ok_or_else(|| anyhow::anyhow!("tap not initialized"))?;
 
+    // Snapshot subscription: periodic push of pipeline snapshots
+    let mut snapshot_interval: Option<tokio::time::Interval> = None;
+
     // Diagnostics: count messages forwarded
     let mut audio_msg_count: u64 = 0;
     let mut vad_msg_count: u64 = 0;
@@ -69,12 +80,12 @@ async fn handle_connection(
 
     loop {
         tokio::select! {
-            // Client messages (subscription commands, dump requests)
+            // Client messages (subscription commands, dump requests, introspection)
             msg = ws_rx.next() => {
                 match msg {
                     Some(Ok(Message::Text(text))) => {
                         if let Ok(val) = serde_json::from_str::<serde_json::Value>(&text) {
-                            // Subscription: {"subscribe": ["capture", "aec_out"]} or {"subscribe": "*"}
+                            // ── Audio tap subscriptions ──────────────────────
                             if let Some(sub) = val.get("subscribe") {
                                 if sub.as_str() == Some("*") {
                                     subscribe_all = true;
@@ -89,19 +100,17 @@ async fn handle_connection(
                                 }
                             }
 
-                            // List dump directories: {"list_dumps": true}
+                            // ── Dump directory browsing ─────────────────────
                             if val.get("list_dumps").is_some() {
                                 let resp = list_dumps(&dump_base);
                                 let _ = ws_tx.send(Message::Text(resp.into())).await;
                             }
 
-                            // List files in a dump: {"list_dump_files": "dump_20260304_123456"}
                             if let Some(name) = val.get("list_dump_files").and_then(|v| v.as_str()) {
                                 let resp = list_dump_files(&dump_base, name);
                                 let _ = ws_tx.send(Message::Text(resp.into())).await;
                             }
 
-                            // Read a dump file: {"read_dump_file": "dump_20260304_123456/capture.pcm", "format": "wav"}
                             if let Some(path) = val.get("read_dump_file").and_then(|v| v.as_str()) {
                                 let format = val.get("format").and_then(|v| v.as_str()).unwrap_or("raw");
                                 let meta_tap = val.get("tap").and_then(|v| v.as_str());
@@ -114,6 +123,42 @@ async fn handle_connection(
                                         let _ = ws_tx.send(Message::Text(err.to_string().into())).await;
                                     }
                                 }
+                            }
+
+                            // ── Pipeline introspection ──────────────────────
+
+                            // Get pipeline snapshot + definition
+                            if val.get("get_pipeline").is_some() {
+                                let resp = get_pipeline(&pipeline_tx).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
+                            }
+
+                            // Subscribe to periodic pipeline snapshots
+                            if let Some(sub) = val.get("subscribe_snapshots") {
+                                if sub.as_bool() == Some(true) {
+                                    let ms = val.get("interval_ms")
+                                        .and_then(|v| v.as_u64())
+                                        .unwrap_or(1000);
+                                    snapshot_interval = Some(tokio::time::interval(
+                                        std::time::Duration::from_millis(ms),
+                                    ));
+                                    tracing::info!(%peer, %ms, "tap: subscribed to snapshots");
+                                } else {
+                                    snapshot_interval = None;
+                                    tracing::info!(%peer, "tap: unsubscribed from snapshots");
+                                }
+                            }
+
+                            // Set a property on a pipeline node
+                            if let Some(obj) = val.get("set_property").and_then(|v| v.as_object()) {
+                                let resp = set_property(&pipeline_tx, obj).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
+                            }
+
+                            // Set pipeline mode
+                            if let Some(mode) = val.get("set_mode").and_then(|v| v.as_str()) {
+                                let resp = set_mode(&pipeline_tx, mode).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
                             }
                         }
                     }
@@ -174,12 +219,103 @@ async fn handle_connection(
                     last_stats = tokio::time::Instant::now();
                 }
             }
+
+            // Periodic snapshot push
+            _ = async {
+                match snapshot_interval.as_mut() {
+                    Some(interval) => interval.tick().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let resp = get_snapshot(&pipeline_tx).await;
+                if ws_tx.send(Message::Text(resp.into())).await.is_err() {
+                    break;
+                }
+            }
         }
     }
 
     tracing::info!(%peer, "tap server: client disconnected");
     Ok(())
 }
+
+// ── Pipeline introspection helpers ──────────────────────────────────
+
+async fn get_pipeline(tx: &mpsc::Sender<PipelineRequest>) -> String {
+    let (snap_reply, snap_rx) = tokio::sync::oneshot::channel();
+    let (def_reply, def_rx) = tokio::sync::oneshot::channel();
+
+    let _ = tx.send(PipelineRequest::GetSnapshot { reply: snap_reply }).await;
+    let _ = tx.send(PipelineRequest::GetDefinition { reply: def_reply }).await;
+
+    let snapshot = snap_rx.await.ok();
+    let definition = def_rx.await.ok();
+
+    serde_json::json!({
+        "type": "pipeline",
+        "snapshot": snapshot,
+        "definition": definition,
+    }).to_string()
+}
+
+async fn get_snapshot(tx: &mpsc::Sender<PipelineRequest>) -> String {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::GetSnapshot { reply }).await;
+
+    match rx.await {
+        Ok(snap) => serde_json::json!({
+            "type": "pipeline_snapshot",
+            "snapshot": snap,
+        }).to_string(),
+        Err(_) => serde_json::json!({
+            "type": "pipeline_snapshot",
+            "error": "orchestrator unavailable",
+        }).to_string(),
+    }
+}
+
+async fn set_property(
+    tx: &mpsc::Sender<PipelineRequest>,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let node = obj.get("node").and_then(|v| v.as_str()).unwrap_or("");
+    let key = obj.get("key").and_then(|v| v.as_str()).unwrap_or("");
+    let value = obj.get("value").cloned().unwrap_or(serde_json::Value::Null);
+
+    if node.is_empty() || key.is_empty() {
+        return serde_json::json!({"type": "set_property_result", "error": "missing node or key"}).to_string();
+    }
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::SetProperty {
+        node: node.to_string(),
+        key: key.to_string(),
+        value,
+        reply,
+    }).await;
+
+    match rx.await {
+        Ok(Ok(())) => serde_json::json!({"type": "set_property_result", "ok": true}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"type": "set_property_result", "error": e.to_string()}).to_string(),
+        Err(_) => serde_json::json!({"type": "set_property_result", "error": "orchestrator unavailable"}).to_string(),
+    }
+}
+
+async fn set_mode(tx: &mpsc::Sender<PipelineRequest>, mode: &str) -> String {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::SetMode {
+        mode: mode.to_string(),
+        reply,
+    }).await;
+
+    match rx.await {
+        Ok(Ok(())) => serde_json::json!({"type": "set_mode_result", "ok": true}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"type": "set_mode_result", "error": e.to_string()}).to_string(),
+        Err(_) => serde_json::json!({"type": "set_mode_result", "error": "orchestrator unavailable"}).to_string(),
+    }
+}
+
+// ── Audio encoding + dump browsing ──────────────────────────────────
 
 /// Encode an audio frame as a binary WebSocket message.
 ///
@@ -223,7 +359,6 @@ fn list_dumps(dump_base: &Option<PathBuf>) -> String {
             if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 if let Some(name) = entry.file_name().to_str() {
                     if name.starts_with("dump_") {
-                        // Try to read meta.json for details
                         let meta_path = entry.path().join("meta.json");
                         let meta = std::fs::read_to_string(&meta_path).ok();
                         dumps.push(serde_json::json!({
@@ -291,9 +426,7 @@ fn read_dump_file(
     let raw_data = std::fs::read(&file_path)?;
 
     if format == "wav" {
-        // Determine sample rate from meta.json
         let sample_rate = if let Some(tap_name) = meta_tap {
-            // Read meta.json from parent directory
             let parent = file_path.parent().unwrap();
             let meta_path = parent.join("meta.json");
             if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
@@ -311,7 +444,6 @@ fn read_dump_file(
             48000
         };
 
-        // Convert raw f32 PCM to WAV
         Ok(raw_f32_to_wav(&raw_data, sample_rate))
     } else {
         Ok(raw_data)
@@ -325,7 +457,7 @@ fn raw_f32_to_wav(raw: &[u8], sample_rate: u32) -> Vec<u8> {
     let bits_per_sample: u16 = 16;
     let byte_rate = sample_rate * (num_channels as u32) * (bits_per_sample as u32 / 8);
     let block_align = num_channels * (bits_per_sample / 8);
-    let data_size = (num_samples * 2) as u32; // i16 = 2 bytes per sample
+    let data_size = (num_samples * 2) as u32;
     let file_size = 36 + data_size;
 
     let mut wav = Vec::with_capacity(44 + data_size as usize);
@@ -337,8 +469,8 @@ fn raw_f32_to_wav(raw: &[u8], sample_rate: u32) -> Vec<u8> {
 
     // fmt chunk
     wav.extend_from_slice(b"fmt ");
-    wav.extend_from_slice(&16u32.to_le_bytes()); // chunk size
-    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM format
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
     wav.extend_from_slice(&num_channels.to_le_bytes());
     wav.extend_from_slice(&sample_rate.to_le_bytes());
     wav.extend_from_slice(&byte_rate.to_le_bytes());
