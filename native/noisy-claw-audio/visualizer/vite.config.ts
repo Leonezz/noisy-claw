@@ -6,4 +6,14 @@ export default defineConfig({
   server: {
     port: 5173,
   },
+  build: {
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          echarts: ['echarts'],
+          xyflow: ['@xyflow/react'],
+        },
+      },
+    },
+  },
 })

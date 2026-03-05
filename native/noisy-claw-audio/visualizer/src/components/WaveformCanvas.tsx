@@ -1,5 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { AudioFrame } from '../lib/protocol'
+import { useECharts } from '../hooks/useECharts'
+import { envelope } from '../lib/downsample'
 
 interface WaveformCanvasProps {
   tap: string
@@ -10,6 +12,8 @@ interface WaveformCanvasProps {
   sampleRate?: number
 }
 
+const NUM_BUCKETS = 600
+
 export function WaveformCanvas({
   tap,
   color,
@@ -18,105 +22,89 @@ export function WaveformCanvas({
   durationSec = 10,
   sampleRate = 48000,
 }: WaveformCanvasProps) {
-  const canvasRef = useRef<HTMLCanvasElement>(null)
+  const containerRef = useRef<HTMLDivElement>(null)
   const bufferRef = useRef<Float32Array>(new Float32Array(sampleRate * durationSec))
   const writeOffsetRef = useRef(0)
-  const animRef = useRef<number>(0)
+  const chart = useECharts(containerRef)
 
   useEffect(() => {
-    // Reallocate buffer if params change
     bufferRef.current = new Float32Array(sampleRate * durationSec)
     writeOffsetRef.current = 0
   }, [sampleRate, durationSec])
 
+  // Subscribe to audio frames — write into ring buffer
   useEffect(() => {
-    const unsubscribe = onFrame((frameTap, frame) => {
+    return onFrame((frameTap, frame) => {
       if (frameTap !== tap) return
-
       const buf = bufferRef.current
-      const samples = frame.samples
-
-      // Ring-buffer write
-      for (let i = 0; i < samples.length; i++) {
-        buf[writeOffsetRef.current] = samples[i]
+      for (let i = 0; i < frame.samples.length; i++) {
+        buf[writeOffsetRef.current] = frame.samples[i]
         writeOffsetRef.current = (writeOffsetRef.current + 1) % buf.length
       }
     })
-
-    return unsubscribe
   }, [tap, onFrame])
 
+  // Initial chart config
   useEffect(() => {
-    const canvas = canvasRef.current
-    if (!canvas) return
+    chart.current?.setOption({
+      backgroundColor: 'transparent',
+      title: {
+        text: tap,
+        left: 4,
+        top: 2,
+        textStyle: { color, fontSize: 11, fontFamily: 'monospace', fontWeight: 'normal' },
+      },
+      grid: { left: 0, right: 0, top: 0, bottom: 0 },
+      xAxis: {
+        type: 'value',
+        show: false,
+        min: 0,
+        max: NUM_BUCKETS - 1,
+      },
+      yAxis: {
+        type: 'value',
+        show: false,
+        min: -1,
+        max: 1,
+      },
+      series: [
+        {
+          type: 'custom',
+          renderItem: (_params: unknown, api: any) => {
+            const x = api.coord([api.value(0), 0])[0]
+            const yMax = api.coord([0, api.value(1)])[1]
+            const yMin = api.coord([0, api.value(2)])[1]
+            return {
+              type: 'line',
+              shape: { x1: x, y1: yMax, x2: x, y2: yMin },
+              style: { stroke: color, lineWidth: 1.5 },
+            }
+          },
+          data: [],
+          animation: false,
+          silent: true,
+        },
+      ],
+    })
+  }, [tap, color, chart])
 
-    const ctx = canvas.getContext('2d')
-    if (!ctx) return
+  // Throttled chart update at ~15 fps
+  useEffect(() => {
+    const interval = setInterval(() => {
+      const c = chart.current
+      if (!c) return
+      const env = envelope(bufferRef.current, writeOffsetRef.current, NUM_BUCKETS)
+      const data = env.map(([max, min], i) => [i, max, min])
+      c.setOption({ series: [{ data }] })
+    }, 66)
 
-    const draw = () => {
-      const w = canvas.width
-      const h = canvas.height
-      const buf = bufferRef.current
-      const totalSamples = buf.length
-      const offset = writeOffsetRef.current
-
-      ctx.fillStyle = '#0a0a0a'
-      ctx.fillRect(0, 0, w, h)
-
-      // Draw center line
-      ctx.strokeStyle = '#333'
-      ctx.lineWidth = 1
-      ctx.beginPath()
-      ctx.moveTo(0, h / 2)
-      ctx.lineTo(w, h / 2)
-      ctx.stroke()
-
-      // Draw waveform (min/max per pixel column)
-      ctx.strokeStyle = color
-      ctx.lineWidth = 1
-      ctx.beginPath()
-
-      const samplesPerPixel = totalSamples / w
-
-      for (let px = 0; px < w; px++) {
-        const startSample = Math.floor(px * samplesPerPixel)
-        const endSample = Math.floor((px + 1) * samplesPerPixel)
-
-        let min = 0
-        let max = 0
-        for (let i = startSample; i < endSample; i++) {
-          const idx = (offset + i) % totalSamples
-          const s = buf[idx]
-          if (s < min) min = s
-          if (s > max) max = s
-        }
-
-        const yMin = h / 2 - max * (h / 2)
-        const yMax = h / 2 - min * (h / 2)
-
-        ctx.moveTo(px, yMin)
-        ctx.lineTo(px, yMax)
-      }
-
-      ctx.stroke()
-
-      // Label
-      ctx.fillStyle = color
-      ctx.font = '11px monospace'
-      ctx.fillText(tap, 4, 14)
-
-      animRef.current = requestAnimationFrame(draw)
-    }
-
-    animRef.current = requestAnimationFrame(draw)
-    return () => cancelAnimationFrame(animRef.current)
-  }, [tap, color])
+    return () => clearInterval(interval)
+  }, [chart])
 
   return (
-    <canvas
-      ref={canvasRef}
-      width={800}
-      height={height}
+    <div
+      ref={containerRef}
+      style={{ height }}
       className="w-full rounded border border-gray-800"
     />
   )
