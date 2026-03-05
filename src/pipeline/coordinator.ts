@@ -1,4 +1,3 @@
-import type { SttConfig } from "../ipc/protocol.js";
 import type {
   AudioSource,
   STTProvider,
@@ -8,6 +7,7 @@ import type {
   STTConfig,
   SegmentMetadata,
 } from "./interfaces.js";
+import type { SttConfig } from "../ipc/protocol.js";
 
 export type PipelineConfig = {
   audio: AudioConfig;
@@ -22,76 +22,83 @@ export type PipelineComponents = {
   audioOutput: AudioOutput;
 };
 
+let requestCounter = 0;
+function nextRequestId(): string {
+  return `req-ts-${String(++requestCounter).padStart(6, "0")}`;
+}
+
+// Sentence boundary characters for chunking LLM deltas
+const SENTENCE_BOUNDARY = /[。！？.!?\n]/;
+
 export class PipelineCoordinator {
   private readonly components: PipelineComponents;
+  private currentSegmentation: SegmentationEngine;
   private messageCallbacks: Array<(message: string, metadata: SegmentMetadata) => void> = [];
   private active = false;
   private paused = false;
-  private echoSuppressed = false;
   private currentConfig: PipelineConfig | null = null;
+  private activeRequestId: string | null = null;
+  // Sentence chunking buffer for streaming TTS
+  private chunkBuffer = "";
 
   constructor(components: PipelineComponents) {
     this.components = components;
+    this.currentSegmentation = components.segmentation;
     this.wireComponents();
   }
 
   private wireComponents(): void {
-    const { audioSource, sttProvider, segmentation, audioOutput } = this.components;
+    const { audioSource, sttProvider, audioOutput } = this.components;
 
-    // Interruption detection: VAD during echo suppression triggers barge-in.
-    // Rust hybrid VAD gate already requires ~192ms of sustained speech at 0.85
-    // threshold before emitting Vad{speaking:true}, so we only add a short
-    // confirmation window here to avoid double-gating.
-    let interruptTimer: ReturnType<typeof setTimeout> | null = null;
-    const INTERRUPT_THRESHOLD_MS = 50;
-
-    // AudioSource VAD -> SegmentationEngine (or interruption during echo suppression)
+    // AudioSource VAD -> current SegmentationEngine (via indirection)
     audioSource.onVAD((speaking) => {
-      if (!this.echoSuppressed) {
-        segmentation.onVAD(speaking);
-        return;
-      }
-
-      // During echo suppression: detect sustained speech as user interruption
-      if (speaking) {
-        if (!interruptTimer) {
-          interruptTimer = setTimeout(() => {
-            interruptTimer = null;
-            audioOutput.stop();
-            this.echoSuppressed = false;
-          }, INTERRUPT_THRESHOLD_MS);
-        }
-      } else {
-        if (interruptTimer) {
-          clearTimeout(interruptTimer);
-          interruptTimer = null;
-        }
-      }
+      this.currentSegmentation.onVAD(speaking);
     });
 
-    // AudioSource audio chunks -> STTProvider (when not suppressed)
+    // AudioSource audio chunks -> STTProvider
     audioSource.onAudio((chunk) => {
-      if (!this.echoSuppressed) {
-        sttProvider.feed(chunk);
-      }
+      sttProvider.feed(chunk);
     });
 
-    // STTProvider transcripts -> SegmentationEngine
+    // STTProvider transcripts -> current SegmentationEngine (via indirection)
     sttProvider.onTranscript((segment) => {
-      segmentation.onTranscript(segment);
+      this.currentSegmentation.onTranscript(segment);
     });
 
-    // SegmentationEngine messages -> callbacks
-    segmentation.onMessage((message, metadata) => {
+    // Wire initial segmentation's message callback
+    this.currentSegmentation.onMessage((message, metadata) => {
       for (const cb of this.messageCallbacks) {
         cb(message, metadata);
       }
     });
 
-    // AudioOutput done -> un-suppress STT
-    audioOutput.onDone(() => {
-      this.echoSuppressed = false;
+    // AudioOutput done -> reset active request
+    audioOutput.onDone((requestId, reason) => {
+      console.log(`[noisy-claw] audioOutput.onDone: requestId=${requestId} reason=${reason}`);
+      this.activeRequestId = null;
     });
+  }
+
+  swapSegmentation(engine: SegmentationEngine): void {
+    this.currentSegmentation.flush();
+    this.currentSegmentation = engine;
+    engine.onMessage((msg, meta) => {
+      for (const cb of this.messageCallbacks) {
+        cb(msg, meta);
+      }
+    });
+  }
+
+  getAudioSource(): PipelineComponents["audioSource"] {
+    return this.components.audioSource;
+  }
+
+  getTranscriptBuffer(): string {
+    return this.currentSegmentation.getBuffer?.() ?? "";
+  }
+
+  flushTranscript(): string | null {
+    return this.currentSegmentation.flush();
   }
 
   start(config: PipelineConfig): void {
@@ -135,23 +142,42 @@ export class PipelineCoordinator {
     return this.paused;
   }
 
-  async speak(text: string): Promise<void> {
-    this.echoSuppressed = true;
-    await this.components.audioOutput.speak(text);
+  speak(text: string): void {
+    const requestId = nextRequestId();
+    this.activeRequestId = requestId;
+    console.log(`[noisy-claw] pipeline.speak: requestId=${requestId}`);
+    this.components.audioOutput.speak(text, requestId);
   }
 
   speakStart(): void {
-    this.echoSuppressed = true;
-    this.components.audioOutput.speakStart?.();
+    const requestId = nextRequestId();
+    this.activeRequestId = requestId;
+    this.chunkBuffer = "";
+    console.log(`[noisy-claw] pipeline.speakStart: requestId=${requestId}`);
+    this.components.audioOutput.speakStart(requestId);
   }
 
   speakChunk(text: string): void {
-    this.components.audioOutput.speakChunk?.(text);
+    if (!this.activeRequestId) return;
+    // Buffer text and flush at sentence boundaries
+    this.chunkBuffer += text;
+    let boundary = this.chunkBuffer.search(SENTENCE_BOUNDARY);
+    while (boundary !== -1) {
+      const sentence = this.chunkBuffer.slice(0, boundary + 1);
+      this.chunkBuffer = this.chunkBuffer.slice(boundary + 1);
+      this.components.audioOutput.speakChunk(sentence, this.activeRequestId);
+      boundary = this.chunkBuffer.search(SENTENCE_BOUNDARY);
+    }
   }
 
-  async speakEnd(): Promise<void> {
-    await this.components.audioOutput.speakEnd?.();
-    this.echoSuppressed = false;
+  speakEnd(): void {
+    if (!this.activeRequestId) return;
+    // Flush remaining buffered text
+    if (this.chunkBuffer.length > 0) {
+      this.components.audioOutput.speakChunk(this.chunkBuffer, this.activeRequestId);
+      this.chunkBuffer = "";
+    }
+    this.components.audioOutput.speakEnd(this.activeRequestId);
   }
 
   onMessage(cb: (message: string, metadata: SegmentMetadata) => void): void {

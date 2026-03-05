@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Internal pipeline sample rate. All nodes process audio at this rate.
+pub const PIPELINE_SAMPLE_RATE: u32 = 48000;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SttConfig {
     pub provider: String,
@@ -38,19 +41,29 @@ pub enum Command {
     Speak {
         text: String,
         tts: TtsConfig,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     SpeakStart {
         tts: TtsConfig,
+        #[serde(default)]
+        request_id: Option<String>,
     },
     SpeakChunk {
         text: String,
     },
     SpeakEnd,
     StopSpeaking,
+    FlushSpeak {
+        request_id: String,
+    },
     PlayAudio {
         path: String,
     },
     StopPlayback,
+    SetMode {
+        mode: String,
+    },
     GetStatus,
     Shutdown,
 }
@@ -60,7 +73,7 @@ fn default_device() -> String {
 }
 
 fn default_sample_rate() -> u32 {
-    16000
+    PIPELINE_SAMPLE_RATE
 }
 
 #[derive(Debug, Serialize)]
@@ -78,8 +91,18 @@ pub enum Event {
         #[serde(skip_serializing_if = "Option::is_none")]
         confidence: Option<f64>,
     },
-    SpeakStarted,
-    SpeakDone,
+    SpeakStarted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+    },
+    SpeakDone {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        reason: String,
+    },
+    TopicShift {
+        similarity: f64,
+    },
     PlaybackDone,
     Status {
         capturing: bool,
@@ -104,7 +127,7 @@ mod tests {
         match cmd {
             Command::StartCapture { device, sample_rate, stt } => {
                 assert_eq!(device, "default");
-                assert_eq!(sample_rate, 16000);
+                assert_eq!(sample_rate, PIPELINE_SAMPLE_RATE);
                 assert!(stt.is_none());
             }
             _ => panic!("expected StartCapture"),
@@ -146,11 +169,12 @@ mod tests {
         let json = r#"{"cmd":"speak","text":"hello","tts":{"provider":"aliyun","model":"cosyvoice-v3-flash","voice":"longanyang"}}"#;
         let cmd: Command = serde_json::from_str(json).unwrap();
         match cmd {
-            Command::Speak { text, tts } => {
+            Command::Speak { text, tts, request_id } => {
                 assert_eq!(text, "hello");
                 assert_eq!(tts.provider, "aliyun");
                 assert_eq!(tts.model.unwrap(), "cosyvoice-v3-flash");
                 assert_eq!(tts.voice.unwrap(), "longanyang");
+                assert!(request_id.is_none());
             }
             _ => panic!("expected Speak"),
         }
@@ -185,6 +209,16 @@ mod tests {
         let json = r#"{"cmd":"stop_playback"}"#;
         let cmd: Command = serde_json::from_str(json).unwrap();
         assert!(matches!(cmd, Command::StopPlayback));
+    }
+
+    #[test]
+    fn deserialize_set_mode() {
+        let json = r#"{"cmd":"set_mode","mode":"meeting"}"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::SetMode { mode } => assert_eq!(mode, "meeting"),
+            _ => panic!("expected SetMode"),
+        }
     }
 
     #[test]
@@ -256,6 +290,14 @@ mod tests {
     }
 
     #[test]
+    fn serialize_topic_shift() {
+        let json = serde_json::to_string(&Event::TopicShift { similarity: 0.42 }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "topic_shift");
+        assert!((v["similarity"].as_f64().unwrap() - 0.42).abs() < 0.001);
+    }
+
+    #[test]
     fn serialize_playback_done() {
         let json = serde_json::to_string(&Event::PlaybackDone).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -264,16 +306,42 @@ mod tests {
 
     #[test]
     fn serialize_speak_started() {
-        let json = serde_json::to_string(&Event::SpeakStarted).unwrap();
+        let json = serde_json::to_string(&Event::SpeakStarted { request_id: Some("req-001".to_string()) }).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["event"], "speak_started");
+        assert_eq!(v["request_id"], "req-001");
+    }
+
+    #[test]
+    fn serialize_speak_started_without_request_id() {
+        let json = serde_json::to_string(&Event::SpeakStarted { request_id: None }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "speak_started");
+        assert!(v.get("request_id").is_none());
     }
 
     #[test]
     fn serialize_speak_done() {
-        let json = serde_json::to_string(&Event::SpeakDone).unwrap();
+        let json = serde_json::to_string(&Event::SpeakDone {
+            request_id: Some("req-001".to_string()),
+            reason: "completed".to_string(),
+        }).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["event"], "speak_done");
+        assert_eq!(v["request_id"], "req-001");
+        assert_eq!(v["reason"], "completed");
+    }
+
+    #[test]
+    fn serialize_speak_done_interrupted() {
+        let json = serde_json::to_string(&Event::SpeakDone {
+            request_id: None,
+            reason: "interrupted".to_string(),
+        }).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["event"], "speak_done");
+        assert!(v.get("request_id").is_none());
+        assert_eq!(v["reason"], "interrupted");
     }
 
     #[test]
@@ -309,8 +377,10 @@ mod tests {
             r#"{"cmd":"speak_chunk","text":"Hello world."}"#,
             r#"{"cmd":"speak_end"}"#,
             r#"{"cmd":"stop_speaking"}"#,
+            r#"{"cmd":"flush_speak","request_id":"req-001"}"#,
             r#"{"cmd":"play_audio","path":"/tmp/test.mp3"}"#,
             r#"{"cmd":"stop_playback"}"#,
+            r#"{"cmd":"set_mode","mode":"meeting"}"#,
             r#"{"cmd":"get_status"}"#,
             r#"{"cmd":"shutdown"}"#,
         ];
@@ -333,8 +403,9 @@ mod tests {
                 end: 1.0,
                 confidence: None,
             },
-            Event::SpeakStarted,
-            Event::SpeakDone,
+            Event::SpeakStarted { request_id: Some("req-001".to_string()) },
+            Event::SpeakDone { request_id: None, reason: "completed".to_string() },
+            Event::TopicShift { similarity: 0.42 },
             Event::PlaybackDone,
             Event::Status { capturing: false, playing: true, speaking: false },
             Event::Error { message: "fail".to_string() },

@@ -29,11 +29,6 @@ export type SegmentMetadata = {
   segmentCount: number;
 };
 
-export type TTSOpts = {
-  voice?: string;
-  speed?: number;
-};
-
 // --- Pipeline Interfaces ---
 
 export interface AudioSource {
@@ -41,6 +36,7 @@ export interface AudioSource {
   stop(): void;
   onAudio(cb: (chunk: AudioChunk) => void): void;
   onVAD(cb: (speaking: boolean) => void): void;
+  onTopicShift?(cb: (similarity: number) => void): void;
 }
 
 export interface STTProvider {
@@ -55,19 +51,16 @@ export interface SegmentationEngine {
   onVAD(speaking: boolean): void;
   onMessage(cb: (message: string, metadata: SegmentMetadata) => void): void;
   flush(): string | null;
-}
-
-export interface TTSProvider {
-  synthesize(text: string, opts?: TTSOpts): Promise<string>; // returns audio file path
+  getBuffer?(): string;
 }
 
 export interface AudioOutput {
-  play(audioPath: string): Promise<void>;
-  speak(text: string): Promise<void>;
+  speak(text: string, requestId: string): void;
+  speakStart(requestId: string): void;
+  speakChunk(text: string, requestId: string): void;
+  speakEnd(requestId: string): void;
   stop(): void;
+  flush(requestId: string): void;
   isPlaying(): boolean;
-  onDone(cb: () => void): void;
-  speakStart?(): void;
-  speakChunk?(text: string): void;
-  speakEnd?(): Promise<void>;
+  onDone(cb: (requestId: string, reason: string) => void): void;
 }

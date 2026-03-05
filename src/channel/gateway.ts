@@ -7,14 +7,18 @@ import type {
 import type { AudioEvent, SttConfig, TtsConfig } from "../ipc/protocol.js";
 import { AudioSubprocess } from "../ipc/subprocess.js";
 import { resolveModelsDir as resolveFromManager } from "../models/manager.js";
+import type { SegmentationEngine } from "../pipeline/interfaces.js";
 import { PipelineCoordinator, type PipelineComponents } from "../pipeline/coordinator.js";
 import { RustLocalPlayback } from "../pipeline/output/rust-playback.js";
+import { DictationSegmentation } from "../pipeline/segmentation/dictation.js";
+import { MeetingSegmentation } from "../pipeline/segmentation/meeting.js";
 import { VADSilenceSegmentation } from "../pipeline/segmentation/vad-silence.js";
 import { RustLocalCapture } from "../pipeline/sources/rust-capture.js";
 import { RustWhisperSTT } from "../pipeline/stt/rust-whisper.js";
 import type { ResolvedVoiceAccount } from "./config.js";
 import { dispatchVoiceTranscript, type VoiceDispatchDeps } from "./dispatch.js";
-import { VoiceSession } from "./session.js";
+import { VoiceSession, type VoiceMode } from "./session.js";
+import type { VoiceConfig } from "../config/schema.js";
 
 // Module-level state (accessible to tools and outbound adapter)
 let activePipeline: PipelineCoordinator | null = null;
@@ -22,6 +26,9 @@ let activeSession: VoiceSession | null = null;
 let activeSubprocess: AudioSubprocess | null = null;
 let injectedRuntime: PluginRuntime | null = null;
 let injectedStateDir: string | null = null;
+let activeVoiceConfig: VoiceConfig | null = null;
+/** Mode to return to when meeting/dictation completes. */
+let previousMode: VoiceMode = "conversation";
 
 export function getActivePipeline(): PipelineCoordinator | null {
   return activePipeline;
@@ -47,6 +54,82 @@ export function setStateDir(dir: string): void {
   injectedStateDir = dir;
 }
 
+function createSegmentation(mode: VoiceMode, config: VoiceConfig): SegmentationEngine {
+  switch (mode) {
+    case "conversation":
+      return new VADSilenceSegmentation({
+        silenceThresholdMs: config.conversation?.endOfTurnSilence ?? 700,
+      });
+    case "dictation":
+      return new DictationSegmentation({
+        endPhrases: config.dictation?.endPhrases,
+      });
+    case "meeting":
+      return new MeetingSegmentation({
+        maxBlockDurationMs: (config.meeting?.maxBlockDurationSec ?? 300) * 1000,
+        silenceBlockMs: config.meeting?.silenceBlockMs ?? 30_000,
+        autoStopSilenceMs: config.meeting?.autoStopSilenceMs ?? 60_000,
+        agentKeywords: config.meeting?.agentKeywords,
+      });
+  }
+}
+
+export function switchMode(mode: VoiceMode): void {
+  if (!activeSession || !activePipeline || !activeSubprocess || !activeVoiceConfig) return;
+
+  // Save current mode so meeting/dictation can return to it on completion
+  const currentMode = activeSession.getState().mode;
+  if (mode === "meeting" || mode === "dictation") {
+    previousMode = currentMode;
+  }
+
+  const seg = createSegmentation(mode, activeVoiceConfig);
+  activePipeline.swapSegmentation(seg);
+
+  // Wire meeting-specific events
+  if (seg instanceof MeetingSegmentation) {
+    // Wire topic shift from RustLocalCapture → MeetingSegmentation
+    const audioSource = activePipeline.getAudioSource();
+    if (audioSource.onTopicShift) {
+      audioSource.onTopicShift(() => seg.onTopicShift());
+    }
+
+    // Wire keyword-addressed dispatch
+    if (injectedRuntime && activeSession) {
+      seg.onKeyword((text) => {
+        if (!injectedRuntime) return;
+        const deps: VoiceDispatchDeps = {
+          runtime: injectedRuntime,
+          cfg: {} as Record<string, unknown>,
+          accountId: "voice",
+          getPipeline: getActivePipeline,
+        };
+        const metadata = { startTime: 0, endTime: 0, segmentCount: 1 };
+        void dispatchVoiceTranscript(deps, text, metadata, "meeting-keyword").catch((err) => {
+          console.error("[noisy-claw] failed to dispatch keyword transcript:", err);
+        });
+      });
+    }
+
+    // Auto-return to previous mode when meeting auto-stops (prolonged silence)
+    seg.onAutoStop(() => {
+      console.log(`[noisy-claw] meeting auto-stopped, returning to ${previousMode} mode`);
+      switchMode(previousMode);
+    });
+  }
+
+  // Wire dictation completion → return to previous mode
+  if (seg instanceof DictationSegmentation) {
+    seg.onComplete(() => {
+      console.log(`[noisy-claw] dictation completed, returning to ${previousMode} mode`);
+      switchMode(previousMode);
+    });
+  }
+
+  activeSubprocess.send({ cmd: "set_mode", mode });
+  activeSession.update(activeSession.setMode(mode));
+}
+
 /**
  * Resolve the API key for a cloud provider config.
  * Priority: explicit config value > environment variable.
@@ -69,9 +152,10 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     const binaryPath = resolveBinaryPath();
     const modelsDir = resolveModelsDir();
 
-    // Create session
+    // Create session and store config for mode switching
     const session = new VoiceSession();
     activeSession = session;
+    activeVoiceConfig = config;
 
     // Resolve STT config for IPC
     const sttProvider = config.stt?.provider ?? "whisper";
@@ -114,25 +198,30 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       binaryPath,
       modelsDir,
       onEvent: (event: AudioEvent) => {
-        if (event.event === "vad" || event.event === "transcript") {
+        if (event.event === "vad") {
+          console.log(`[noisy-claw] IPC event: vad speaking=${event.speaking}`);
           rustCapture?.handleEvent(event);
         }
         if (event.event === "transcript") {
+          rustCapture?.handleEvent(event);
           rustSTT?.handleEvent(event);
         }
         if (event.event === "playback_done" || event.event === "speak_done") {
+          console.log(`[noisy-claw] IPC event: ${event.event}`);
           rustPlayback?.handleEvent(event);
         }
         if (event.event === "speak_started") {
+          console.log("[noisy-claw] IPC event: speak_started");
           session.update(session.setSpeaking(true));
         }
         if (event.event === "speak_done") {
           session.update(session.setSpeaking(false));
         }
+        if (event.event === "topic_shift") {
+          rustCapture?.handleEvent(event);
+        }
         if (event.event === "error") {
-          console.error(
-            `[noisy-claw] audio engine error: ${(event as { message?: string }).message}`,
-          );
+          console.error(`[noisy-claw] audio engine error: ${event.message}`);
         }
       },
       onError: (err) => {
@@ -170,9 +259,10 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     activePipeline = pipeline;
     activeSubprocess = subprocess;
 
-    // Wire message callback to track segments and dispatch to agent
+    // Wire message callback to track segments, log transcript, and dispatch to agent
     pipeline.onMessage((message, metadata) => {
       session.update(session.incrementSegments());
+      session.logTranscript(message, metadata.startTime, metadata.endTime);
 
       if (!injectedRuntime) {
         console.warn("[noisy-claw] transcript received but no runtime injected, skipping dispatch");
@@ -189,7 +279,8 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
       console.log(
         `[noisy-claw] dispatching transcript: "${message.slice(0, 80)}${message.length > 80 ? "..." : ""}"`,
       );
-      void dispatchVoiceTranscript(deps, message, metadata).catch((err) => {
+      const currentMode = session.getState().mode;
+      void dispatchVoiceTranscript(deps, message, metadata, currentMode).catch((err) => {
         console.error("[noisy-claw] failed to dispatch transcript:", err);
       });
     });
@@ -201,7 +292,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     pipeline.start({
       audio: {
         device: config.audio.device ?? "default",
-        sampleRate: config.audio.sampleRate ?? 16000,
+        sampleRate: config.audio.sampleRate ?? 48000,
       },
       stt: {
         model: config.stt?.model ?? "base",
@@ -231,6 +322,8 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
           activePipeline = null;
           activeSession = null;
           activeSubprocess = null;
+          activeVoiceConfig = null;
+          previousMode = "conversation";
           resolve();
         },
         { once: true },
@@ -244,6 +337,8 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     activePipeline = null;
     activeSession = null;
     activeSubprocess = null;
+    activeVoiceConfig = null;
+    previousMode = "conversation";
   },
 };
 

@@ -37,11 +37,13 @@ export type SpeakCommand = {
   cmd: "speak";
   text: string;
   tts: TtsConfig;
+  request_id?: string;
 };
 
 export type SpeakStartCommand = {
   cmd: "speak_start";
   tts: TtsConfig;
+  request_id?: string;
 };
 
 export type SpeakChunkCommand = {
@@ -51,6 +53,11 @@ export type SpeakChunkCommand = {
 
 export type SpeakEndCommand = {
   cmd: "speak_end";
+};
+
+export type FlushSpeakCommand = {
+  cmd: "flush_speak";
+  request_id: string;
 };
 
 export type StopSpeakingCommand = {
@@ -70,6 +77,11 @@ export type GetStatusCommand = {
   cmd: "get_status";
 };
 
+export type SetModeCommand = {
+  cmd: "set_mode";
+  mode: string;
+};
+
 export type ShutdownCommand = {
   cmd: "shutdown";
 };
@@ -82,8 +94,10 @@ export type Command =
   | SpeakChunkCommand
   | SpeakEndCommand
   | StopSpeakingCommand
+  | FlushSpeakCommand
   | PlayAudioCommand
   | StopPlaybackCommand
+  | SetModeCommand
   | GetStatusCommand
   | ShutdownCommand;
 
@@ -108,10 +122,13 @@ export type TranscriptEvent = {
 
 export type SpeakStartedEvent = {
   event: "speak_started";
+  request_id?: string;
 };
 
 export type SpeakDoneEvent = {
   event: "speak_done";
+  request_id?: string;
+  reason: string;
 };
 
 export type PlaybackDoneEvent = {
@@ -125,6 +142,11 @@ export type StatusEvent = {
   speaking: boolean;
 };
 
+export type TopicShiftEvent = {
+  event: "topic_shift";
+  similarity: number;
+};
+
 export type ErrorEvent = {
   event: "error";
   message: string;
@@ -136,13 +158,22 @@ export type AudioEvent =
   | TranscriptEvent
   | SpeakStartedEvent
   | SpeakDoneEvent
+  | TopicShiftEvent
   | PlaybackDoneEvent
   | StatusEvent
   | ErrorEvent;
 
 export function parseEvent(line: string): AudioEvent | null {
   try {
-    return JSON.parse(line) as AudioEvent;
+    const parsed: unknown = JSON.parse(line);
+    if (
+      typeof parsed !== "object" ||
+      parsed === null ||
+      typeof (parsed as Record<string, unknown>).event !== "string"
+    ) {
+      return null;
+    }
+    return parsed as AudioEvent;
   } catch {
     return null;
   }

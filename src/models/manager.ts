@@ -14,6 +14,7 @@ export type EnsureModelsOptions = {
   modelsDir: string;
   sttModelId?: string;
   sttProvider?: string;
+  meetingMode?: boolean;
   onProgress?: (progress: DownloadProgress) => void;
   onStatus?: (message: string) => void;
   signal?: AbortSignal;
@@ -35,6 +36,18 @@ export async function ensureModels(options: EnsureModelsOptions): Promise<Ensure
 
   // Collect required models (VAD is always needed)
   const needed: ModelEntry[] = [...getRequiredModels()];
+
+  // Include embedding models when meeting mode is configured
+  if (options.meetingMode) {
+    const onnxModel = findModel("multilingual-minilm-onnx");
+    const tokenizerModel = findModel("multilingual-minilm-tokenizer");
+    if (onnxModel && !needed.some((m) => m.id === onnxModel.id)) {
+      needed.push(onnxModel);
+    }
+    if (tokenizerModel && !needed.some((m) => m.id === tokenizerModel.id)) {
+      needed.push(tokenizerModel);
+    }
+  }
 
   // Only include Whisper model when using local STT
   if (sttProvider === "whisper") {

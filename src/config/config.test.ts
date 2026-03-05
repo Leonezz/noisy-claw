@@ -45,7 +45,7 @@ describe("DEFAULT_VOICE_CONFIG", () => {
   it("has all required fields", () => {
     expect(DEFAULT_VOICE_CONFIG.enabled).toBe(true);
     expect(DEFAULT_VOICE_CONFIG.mode).toBe("conversation");
-    expect(DEFAULT_VOICE_CONFIG.audio.sampleRate).toBe(16000);
+    expect(DEFAULT_VOICE_CONFIG.audio.sampleRate).toBe(48000);
     expect(DEFAULT_VOICE_CONFIG.audio.device).toBe("default");
     expect(DEFAULT_VOICE_CONFIG.stt.provider).toBe("whisper");
     expect(DEFAULT_VOICE_CONFIG.stt.languages).toEqual(["en"]);

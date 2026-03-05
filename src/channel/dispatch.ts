@@ -1,6 +1,10 @@
 import type { PluginRuntime } from "openclaw/plugin-sdk";
 import type { PipelineCoordinator } from "../pipeline/coordinator.js";
 import type { SegmentMetadata } from "../pipeline/interfaces.js";
+import type { VoiceMode } from "./session.js";
+
+/** Dispatch mode: VoiceMode plus "meeting-keyword" for keyword-addressed meeting input. */
+export type DispatchMode = VoiceMode | "meeting-keyword";
 
 export type VoiceDispatchDeps = {
   runtime: PluginRuntime;
@@ -20,6 +24,7 @@ export async function dispatchVoiceTranscript(
   deps: VoiceDispatchDeps,
   transcript: string,
   _metadata: SegmentMetadata,
+  mode: DispatchMode = "conversation",
 ): Promise<void> {
   const { runtime, cfg, accountId } = deps;
 
@@ -33,9 +38,19 @@ export async function dispatchVoiceTranscript(
     peer: { kind: "direct", id: sessionId },
   });
 
+  const bodyForAgent =
+    mode === "dictation"
+      ? `[Dictation result]: ${transcript}`
+      : mode === "meeting"
+        ? `[Meeting transcript block]: ${transcript}`
+        : `[Voice input from microphone]: ${transcript}`;
+
+  // TTS is opt-in via the voice_speak tool; auto-TTS only for keyword-addressed meeting input
+  const ttsEnabled = mode === "meeting-keyword";
+
   const msgCtx = {
     Body: transcript,
-    BodyForAgent: `[Voice input from microphone]: ${transcript}`,
+    BodyForAgent: bodyForAgent,
     RawBody: transcript,
     CommandBody: transcript,
     Transcript: transcript,
@@ -55,11 +70,12 @@ export async function dispatchVoiceTranscript(
 
   const finalizedCtx = runtime.channel.reply.finalizeInboundContext(msgCtx);
 
-  // Streaming state for sentence-boundary TTS
+  // Streaming state for sentence-boundary TTS (only when TTS is enabled)
   let streamStarted = false;
   let sentCursor = 0;
 
   function flushSentences(fullText: string, force: boolean): void {
+    if (!ttsEnabled) return;
     const pipeline = deps.getPipeline();
     if (!pipeline?.isActive) return;
 
@@ -105,7 +121,6 @@ export async function dispatchVoiceTranscript(
           console.log(
             `[noisy-claw] agent reply: ${text.slice(0, 100)}${text.length > 100 ? "…" : ""}`,
           );
-          // Final delivery per block — flush remaining text
           flushSentences(text, true);
         }
       },
@@ -126,7 +141,7 @@ export async function dispatchVoiceTranscript(
   if (streamStarted) {
     const pipeline = deps.getPipeline();
     if (pipeline?.isActive) {
-      await pipeline.speakEnd();
+      pipeline.speakEnd();
     }
   }
 }
