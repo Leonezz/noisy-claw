@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { type AudioFrame, type VadMeta, type DumpEntry, parseAudioFrame } from '../lib/protocol'
+import { type AudioFrame, type VadMeta, type DumpEntry, type PipelineData, parseAudioFrame } from '../lib/protocol'
 
 export interface TapState {
   connected: boolean
@@ -30,6 +30,8 @@ export function useTapSocket({
   const levelsRef = useRef<Map<string, number>>(new Map())
   const listenersRef = useRef<Set<(tap: string, frame: AudioFrame) => void>>(new Set())
   const vadListenersRef = useRef<Set<(meta: VadMeta) => void>>(new Set())
+  const pipelineListenersRef = useRef<Set<(data: PipelineData) => void>>(new Set())
+  const pipelineRef = useRef<PipelineData>({ definition: null, snapshot: null })
   const pausedRef = useRef(paused)
   pausedRef.current = paused
 
@@ -93,6 +95,22 @@ export function useTapSocket({
             for (const listener of vadListenersRef.current) {
               listener(meta)
             }
+          } else if (msg.type === 'pipeline') {
+            pipelineRef.current = {
+              definition: msg.definition ?? null,
+              snapshot: msg.snapshot ?? null,
+            }
+            for (const listener of pipelineListenersRef.current) {
+              listener(pipelineRef.current)
+            }
+          } else if (msg.type === 'pipeline_snapshot') {
+            pipelineRef.current = {
+              ...pipelineRef.current,
+              snapshot: msg.snapshot ?? null,
+            }
+            for (const listener of pipelineListenersRef.current) {
+              listener(pipelineRef.current)
+            }
           }
         } catch {
           // ignore non-JSON text
@@ -129,12 +147,37 @@ export function useTapSocket({
     [],
   )
 
+  const onPipeline = useCallback(
+    (listener: (data: PipelineData) => void) => {
+      pipelineListenersRef.current.add(listener)
+      return () => {
+        pipelineListenersRef.current.delete(listener)
+      }
+    },
+    [],
+  )
+
   const sendCommand = useCallback((cmd: Record<string, unknown>) => {
     const ws = wsRef.current
     if (ws && ws.readyState === WebSocket.OPEN) {
       ws.send(JSON.stringify(cmd))
     }
   }, [])
+
+  const fetchPipeline = useCallback(() => {
+    sendCommand({ get_pipeline: true })
+  }, [sendCommand])
+
+  const subscribePipelineSnapshots = useCallback(
+    (intervalMs = 2000) => {
+      sendCommand({ subscribe_snapshots: true, interval_ms: intervalMs })
+    },
+    [sendCommand],
+  )
+
+  const unsubscribePipelineSnapshots = useCallback(() => {
+    sendCommand({ subscribe_snapshots: false })
+  }, [sendCommand])
 
   const listDumps = useCallback((): Promise<DumpEntry[]> => {
     return new Promise((resolve) => {
@@ -211,7 +254,11 @@ export function useTapSocket({
     levelsRef,
     onFrame,
     onVadMeta,
+    onPipeline,
     sendCommand,
+    fetchPipeline,
+    subscribePipelineSnapshots,
+    unsubscribePipelineSnapshots,
     listDumps,
     requestDumpFile,
   }

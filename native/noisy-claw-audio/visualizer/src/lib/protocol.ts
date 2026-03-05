@@ -72,3 +72,47 @@ export function rmsToDb(rms: number): number {
   if (rms <= 0) return -100
   return 20 * Math.log10(rms)
 }
+
+// ── Pipeline introspection types ──────────────────────────────────
+
+export interface PortDescriptor {
+  name: string
+  port_type: 'Audio' | 'VadEvent' | 'OutputMsg' | 'IpcEvent' | 'Signal'
+  direction: 'In' | 'Out'
+}
+
+export interface NodeDefinition {
+  name: string
+  type: string
+  properties: Record<string, unknown>
+}
+
+export interface LinkDefinition {
+  from: string
+  to: string
+}
+
+export interface PipelineDefinition {
+  name: string
+  nodes: NodeDefinition[]
+  links: LinkDefinition[]
+  modes: Record<string, Record<string, unknown>>
+}
+
+export interface NodeSnapshot {
+  node_type: string
+  status: string
+  properties: Record<string, unknown>
+  metrics: Record<string, unknown>
+}
+
+export interface PipelineSnapshot {
+  name: string
+  current_mode: string | null
+  nodes: Record<string, NodeSnapshot>
+}
+
+export interface PipelineData {
+  definition: PipelineDefinition | null
+  snapshot: PipelineSnapshot | null
+}
