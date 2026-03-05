@@ -46,7 +46,10 @@ const plugin = {
       createVoiceSpeakTool({ getPipeline: getActivePipeline }),
     );
     api.registerTool(() =>
-      createVoiceTranscriptTool({ getPipeline: getActivePipeline }),
+      createVoiceTranscriptTool({
+        getPipeline: getActivePipeline,
+        getSession: getActiveSession,
+      }),
     );
 
     // CLI: `openclaw voice setup` / `openclaw voice models`
@@ -74,6 +77,7 @@ const plugin = {
         const result = await ensureModels({
           modelsDir,
           sttProvider,
+          meetingMode: true, // always download embedding models — meeting mode can be activated anytime
           onStatus: (msg) => ctx.logger.info(msg),
           onProgress: (p) => {
             if (p.percent % 25 === 0) {

@@ -89,7 +89,6 @@ All fields are optional. Shown below with defaults:
       "mode": "conversation",
       "audio": {
         "source": "mic",
-        "sampleRate": 16000,
         "device": "default"
       },
       "stt": {
@@ -105,7 +104,6 @@ All fields are optional. Shown below with defaults:
         "provider": "aliyun",
         "model": "cosyvoice-v3-flash",
         "voice": "longanyang",
-        "sampleRate": 16000,
         "speed": 1.0
       },
       "conversation": {

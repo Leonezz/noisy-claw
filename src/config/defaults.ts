@@ -5,7 +5,7 @@ export const DEFAULT_VOICE_CONFIG: Required<VoiceConfig> = {
   mode: "conversation",
   audio: {
     source: "mic",
-    sampleRate: 16000,
+    sampleRate: 48000,
     device: "default",
   },
   stt: {

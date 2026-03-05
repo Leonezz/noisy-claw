@@ -40,6 +40,13 @@ async fn main() -> Result<()> {
     let dump_enabled = pipeline::dump::init();
     tracing::info!(dump_enabled, "audio dump");
 
+    // ── WebSocket audio tap server (opt-in via AUDIO_TAP_PORT env var) ──
+    if let Ok(port_str) = std::env::var("AUDIO_TAP_PORT") {
+        let port: u16 = port_str.parse().unwrap_or(9876);
+        let dump_base = pipeline::dump::dump_base_dir();
+        pipeline::tap::spawn_server(port, dump_base);
+    }
+
     // ── IPC event channel → stdout writer + transcript tap ─────────────
     let (event_tx, mut event_rx) = mpsc::channel::<Event>(256);
     let (transcript_tap_tx, mut transcript_tap_rx) = mpsc::channel::<String>(64);
@@ -295,6 +302,17 @@ async fn handle_command(
             sample_rate,
             stt,
         } => {
+            // Pipeline always runs at PIPELINE_SAMPLE_RATE (48kHz).
+            // Ignore sample_rate from TS — it may carry stale user config values.
+            let pipeline_rate = protocol::PIPELINE_SAMPLE_RATE;
+            if sample_rate != pipeline_rate {
+                tracing::warn!(
+                    requested = sample_rate,
+                    using = pipeline_rate,
+                    "orchestrator: ignoring requested sample_rate, using pipeline rate"
+                );
+            }
+
             // Check VAD initialization
             if !vad_handle.is_initialized() {
                 tracing::error!("orchestrator: VAD not initialized, rejecting StartCapture");
@@ -312,7 +330,7 @@ async fn handle_command(
 
             let stt_provider_str = stt_provider.to_string();
             tracing::info!(
-                %device, sample_rate, stt_provider = %stt_provider_str,
+                %device, sample_rate = pipeline_rate, stt_provider = %stt_provider_str,
                 "orchestrator: starting capture pipeline"
             );
 
@@ -325,13 +343,13 @@ async fn handle_command(
                     .await;
             } else if let Some(stt_config) = stt {
                 tracing::info!(stt_provider = %stt_provider_str, "orchestrator: starting cloud STT");
-                stt_handle.start_cloud(stt_config, sample_rate).await;
+                stt_handle.start_cloud(stt_config).await;
             }
 
-            // Start capture
-            capture_handle.start(&device, sample_rate).await;
+            // Start capture at pipeline rate (48kHz)
+            capture_handle.start(&device, pipeline_rate).await;
             tracing::info!(
-                %device, sample_rate,
+                %device, sample_rate = pipeline_rate,
                 is_capturing = capture_handle.is_capturing(),
                 "orchestrator: capture started"
             );

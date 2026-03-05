@@ -6,13 +6,7 @@ use webrtc_audio_processing_config::{
     HighPassFilter, NoiseSuppression,
 };
 
-use crate::audio_utils::resample_linear;
-
-/// AEC runs at 48kHz to match the typical output device rate.
-/// This avoids downsampling the render reference (which would introduce
-/// aliasing from the simple linear resampler), giving AEC a clean
-/// reference signal that accurately matches the speaker output.
-const AEC_SAMPLE_RATE: u32 = 48000;
+use crate::protocol::PIPELINE_SAMPLE_RATE;
 
 pub struct EchoCanceller {
     processor: Processor,
@@ -23,7 +17,7 @@ pub struct EchoCanceller {
 
 impl EchoCanceller {
     pub fn new() -> Result<Self> {
-        let processor = Processor::new(AEC_SAMPLE_RATE)
+        let processor = Processor::new(PIPELINE_SAMPLE_RATE)
             .map_err(|e| anyhow::anyhow!("webrtc-audio-processing init: {:?}", e))?;
 
         let config = Config {
@@ -52,15 +46,14 @@ impl EchoCanceller {
     }
 
     /// Feed speaker reference audio (output going to speakers).
-    /// Samples should be mono f32 at any sample rate — will be resampled to 48kHz if needed.
-    /// Each complete frame is immediately passed to the AEC engine.
+    /// Samples must be mono f32 at PIPELINE_SAMPLE_RATE (48kHz).
     pub fn feed_render(&mut self, samples: &[f32], sample_rate: u32) {
-        let resampled = if sample_rate != AEC_SAMPLE_RATE {
-            resample_linear(samples, sample_rate, AEC_SAMPLE_RATE)
-        } else {
-            samples.to_vec()
-        };
-        self.render_buf.extend_from_slice(&resampled);
+        debug_assert_eq!(
+            sample_rate, PIPELINE_SAMPLE_RATE,
+            "AEC feed_render expects {}Hz, got {}Hz",
+            PIPELINE_SAMPLE_RATE, sample_rate
+        );
+        self.render_buf.extend_from_slice(samples);
 
         while self.render_buf.len() >= self.frame_size {
             let frame_buf: Vec<f32> = self.render_buf.drain(..self.frame_size).collect();
@@ -70,31 +63,27 @@ impl EchoCanceller {
     }
 
     /// Process microphone capture audio through AEC + noise suppression + HPF.
-    /// Samples should be mono f32 at any sample rate — will be resampled to 48kHz internally.
-    /// Returns cleaned audio at the original sample rate.
+    /// Samples must be mono f32 at PIPELINE_SAMPLE_RATE (48kHz).
+    /// Returns cleaned audio at 48kHz.
     pub fn process_capture(&mut self, samples: &[f32], sample_rate: u32) -> Vec<f32> {
-        let resampled = if sample_rate != AEC_SAMPLE_RATE {
-            resample_linear(samples, sample_rate, AEC_SAMPLE_RATE)
-        } else {
-            samples.to_vec()
-        };
-        self.capture_buf.extend_from_slice(&resampled);
+        debug_assert_eq!(
+            sample_rate, PIPELINE_SAMPLE_RATE,
+            "AEC process_capture expects {}Hz, got {}Hz",
+            PIPELINE_SAMPLE_RATE, sample_rate
+        );
+        self.capture_buf.extend_from_slice(samples);
 
-        let mut cleaned_48k = Vec::new();
+        let mut cleaned = Vec::new();
         while self.capture_buf.len() >= self.frame_size {
             let frame_buf: Vec<f32> = self.capture_buf.drain(..self.frame_size).collect();
             let mut channels = vec![frame_buf];
             match self.processor.process_capture_frame(&mut channels) {
-                Ok(_) => cleaned_48k.extend_from_slice(&channels[0]),
-                Err(_) => cleaned_48k.extend_from_slice(&channels[0]), // passthrough on error
+                Ok(_) => cleaned.extend_from_slice(&channels[0]),
+                Err(_) => cleaned.extend_from_slice(&channels[0]),
             }
         }
 
-        if sample_rate != AEC_SAMPLE_RATE && !cleaned_48k.is_empty() {
-            resample_linear(&cleaned_48k, AEC_SAMPLE_RATE, sample_rate)
-        } else {
-            cleaned_48k
-        }
+        cleaned
     }
 
     /// Reset internal accumulation buffers (does NOT reset AEC filter state).
@@ -134,28 +123,13 @@ mod tests {
     }
 
     #[test]
-    fn process_capture_at_16k_render_at_48k() {
+    fn process_100ms_at_48k() {
         let mut ec = EchoCanceller::new().unwrap();
-        // Render at 48kHz (native, no resample)
-        let render = vec![0.1f32; 480];
-        ec.feed_render(&render, 48000);
-        // Capture at 16kHz (upsampled internally)
-        let capture = vec![0.0f32; 160];
-        let result = ec.process_capture(&capture, 16000);
-        // Result should be back at 16kHz — length may vary due to resampling
-        assert!(!result.is_empty() || result.is_empty()); // ensure no panic
-    }
-
-    #[test]
-    fn process_with_resampling() {
-        let mut ec = EchoCanceller::new().unwrap();
-        // Feed render at 48kHz, capture at 16kHz
         let render = vec![0.0f32; 4800]; // 100ms at 48kHz
         ec.feed_render(&render, 48000);
-        let capture = vec![0.0f32; 1600]; // 100ms at 16kHz
-        let result = ec.process_capture(&capture, 16000);
-        // Output should be at 16kHz
-        assert!(!result.is_empty());
+        let capture = vec![0.0f32; 4800]; // 100ms at 48kHz
+        let result = ec.process_capture(&capture, 48000);
+        assert_eq!(result.len(), 4800);
     }
 
     #[test]

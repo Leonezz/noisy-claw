@@ -1,36 +1,19 @@
 import type { ChannelOutboundAdapter } from "openclaw/plugin-sdk";
-import { getActivePipeline, getActiveSession } from "./gateway.js";
 
 export const voiceOutboundAdapter: ChannelOutboundAdapter = {
   deliveryMode: "direct",
   textChunkLimit: 4000,
 
-  sendText: async (ctx) => {
-    // Only synthesize TTS in conversation mode
-    const session = getActiveSession();
-    const mode = session?.getState().mode ?? "conversation";
-    if (mode === "conversation") {
-      const pipeline = getActivePipeline();
-      if (pipeline) {
-        pipeline.speak(ctx.text);
-      }
-    }
-
+  sendText: async (_ctx) => {
+    // TTS is opt-in via the voice_speak tool; outbound adapter delivers text-only
     return {
       channel: "voice",
       messageId: `voice-${Date.now()}`,
     };
   },
 
-  sendMedia: async (ctx) => {
-    const session = getActiveSession();
-    const mode = session?.getState().mode ?? "conversation";
-    if (ctx.text && mode === "conversation") {
-      const pipeline = getActivePipeline();
-      if (pipeline) {
-        pipeline.speak(ctx.text);
-      }
-    }
+  sendMedia: async (_ctx) => {
+    // TTS is opt-in via the voice_speak tool; outbound adapter delivers text-only
     return {
       channel: "voice",
       messageId: `voice-${Date.now()}`,

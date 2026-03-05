@@ -4,10 +4,11 @@ export type DictationConfig = {
   endPhrases?: string[];
 };
 
-const DEFAULT_END_PHRASES = ["end dictation", "结束听写"];
+const DEFAULT_END_PHRASES = ["end dictation", "结束听写", "完成听写", "完成输入", "结束输入"];
 
 export class DictationSegmentation implements SegmentationEngine {
   private messageCallbacks: Array<(message: string, metadata: SegmentMetadata) => void> = [];
+  private completeCallbacks: Array<() => void> = [];
   private buffer: TranscriptSegment[] = [];
   private readonly endPhrases: string[];
 
@@ -21,17 +22,22 @@ export class DictationSegmentation implements SegmentationEngine {
     const text = segment.text.trim();
     if (!text) return;
 
-    // Check for end phrase match
-    const lower = text.toLowerCase();
+    // Check for end phrase match (strip trailing punctuation that STT may append)
+    const lower = text.toLowerCase().replace(/[\s.。!！?？,，;；:：、]+$/, "");
     const matchedPhrase = this.endPhrases.find((phrase) => lower.endsWith(phrase));
 
     if (matchedPhrase) {
-      // Strip the end phrase from the final segment
-      const strippedText = text.slice(0, text.length - matchedPhrase.length).trim();
+      // Strip the end phrase (and any trailing punctuation) from the final segment
+      const idx = lower.lastIndexOf(matchedPhrase);
+      const strippedText = text.slice(0, idx).trim();
       if (strippedText) {
         this.buffer.push({ ...segment, text: strippedText });
       }
       this.emit();
+      // Notify completion — dictation session is done
+      for (const cb of this.completeCallbacks) {
+        cb();
+      }
     } else {
       this.buffer.push(segment);
     }
@@ -43,6 +49,11 @@ export class DictationSegmentation implements SegmentationEngine {
 
   onMessage(cb: (message: string, metadata: SegmentMetadata) => void): void {
     this.messageCallbacks.push(cb);
+  }
+
+  /** Register a callback for when dictation completes (end phrase detected). */
+  onComplete(cb: () => void): void {
+    this.completeCallbacks.push(cb);
   }
 
   flush(): string | null {

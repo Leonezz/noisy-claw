@@ -79,13 +79,13 @@ describe("PipelineCoordinator", () => {
 
   it("starts audio source and STT on start()", () => {
     coordinator.start({
-      audio: { device: "default", sampleRate: 16000 },
+      audio: { device: "default", sampleRate: 48000 },
       stt: { model: "base", language: "en" },
     });
 
     expect(mocks.audioSource.start).toHaveBeenCalledWith({
       device: "default",
-      sampleRate: 16000,
+      sampleRate: 48000,
     });
     expect(mocks.sttProvider.start).toHaveBeenCalledWith({
       model: "base",
@@ -95,7 +95,7 @@ describe("PipelineCoordinator", () => {
 
   it("does not start twice", () => {
     const config = {
-      audio: { device: "default", sampleRate: 16000 },
+      audio: { device: "default", sampleRate: 48000 },
       stt: { model: "base", language: "en" },
     };
     coordinator.start(config);
@@ -106,7 +106,7 @@ describe("PipelineCoordinator", () => {
 
   it("stops and flushes on stop()", () => {
     coordinator.start({
-      audio: { device: "default", sampleRate: 16000 },
+      audio: { device: "default", sampleRate: 48000 },
       stt: { model: "base", language: "en" },
     });
     coordinator.stop();
@@ -219,7 +219,7 @@ describe("PipelineCoordinator", () => {
   it("isActive reflects pipeline state", () => {
     expect(coordinator.isActive).toBe(false);
     coordinator.start({
-      audio: { device: "default", sampleRate: 16000 },
+      audio: { device: "default", sampleRate: 48000 },
       stt: { model: "base", language: "en" },
     });
     expect(coordinator.isActive).toBe(true);

@@ -4,12 +4,30 @@ use std::io::{BufWriter, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 use std::sync::OnceLock;
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 static DUMP: OnceLock<DumpInner> = OnceLock::new();
+static DUMP_START: OnceLock<Instant> = OnceLock::new();
+
+/// Real-time tap message broadcast over WebSocket.
+#[derive(Clone)]
+pub enum TapMessage {
+    Audio {
+        tap: &'static str,
+        samples: Vec<f32>,
+        sample_rate: u32,
+        /// Monotonic timestamp in seconds since dump init (pipeline start).
+        timestamp: f64,
+    },
+    VadMeta {
+        data: String,
+        timestamp: f64,
+    },
+}
 
 struct DumpInner {
     tx: Sender<DumpMsg>,
+    tap_tx: tokio::sync::broadcast::Sender<TapMessage>,
 }
 
 enum DumpMsg {
@@ -24,47 +42,95 @@ enum DumpMsg {
     Finish,
 }
 
-/// Initialize the audio dump system.
+/// Initialize the audio dump + tap system.
 ///
-/// Reads `AUDIO_DUMP_DIR` env var. If set, creates a timestamped sub-directory
-/// and spawns a background writer thread. Returns `true` if dumping is enabled.
-/// No-op (returns `false`) if the env var is unset.
+/// File dump: reads `AUDIO_DUMP_DIR` env var. If set, creates a timestamped
+/// sub-directory and spawns a background writer thread.
+///
+/// Real-time tap: always initialized (broadcast channel for WebSocket server).
+///
+/// Returns `true` if file dumping is enabled.
 pub fn init() -> bool {
+    let _ = DUMP_START.set(Instant::now());
+
+    // Broadcast channel for real-time tap (dropped msgs are fine — lagging subscribers).
+    // Capacity must be large enough to handle all taps at full audio rate (~300+ msgs/sec)
+    // without causing persistent lagging on the subscriber side.
+    let (tap_tx, _) = tokio::sync::broadcast::channel::<TapMessage>(4096);
+
     let base_dir = match std::env::var("AUDIO_DUMP_DIR") {
-        Ok(d) if !d.is_empty() => PathBuf::from(d),
-        _ => return false,
+        Ok(d) if !d.is_empty() => Some(PathBuf::from(d)),
+        _ => None,
     };
 
-    let timestamp = format_timestamp();
-    let dump_dir = base_dir.join(format!("dump_{timestamp}"));
+    let file_dump_enabled = if let Some(base_dir) = base_dir {
+        let timestamp = format_timestamp();
+        let dump_dir = base_dir.join(format!("dump_{timestamp}"));
 
-    if let Err(e) = fs::create_dir_all(&dump_dir) {
-        tracing::error!(%e, path = %dump_dir.display(), "audio dump: failed to create directory");
-        return false;
-    }
+        if let Err(e) = fs::create_dir_all(&dump_dir) {
+            tracing::error!(%e, path = %dump_dir.display(), "audio dump: failed to create directory");
+            // Still initialize tap channel for real-time WS even if file dump fails
+            let (tx, _rx) = mpsc::channel::<DumpMsg>();
+            let _ = DUMP.set(DumpInner { tx, tap_tx });
+            false
+        } else {
+            let (tx, rx) = mpsc::channel::<DumpMsg>();
 
-    let (tx, rx) = mpsc::channel::<DumpMsg>();
+            let writer_dir = dump_dir.clone();
+            std::thread::Builder::new()
+                .name("audio-dump".into())
+                .spawn(move || writer_thread(rx, writer_dir))
+                .expect("failed to spawn audio dump writer thread");
 
-    let writer_dir = dump_dir.clone();
-    std::thread::Builder::new()
-        .name("audio-dump".into())
-        .spawn(move || writer_thread(rx, writer_dir))
-        .expect("failed to spawn audio dump writer thread");
+            let ok = DUMP.set(DumpInner { tx, tap_tx }).is_ok();
+            if ok {
+                tracing::info!(path = %dump_dir.display(), "audio dump: enabled");
+            }
+            ok
+        }
+    } else {
+        // No file dump, but still initialize tap channel for real-time WS
+        let (tx, _rx) = mpsc::channel::<DumpMsg>();
+        let _ = DUMP.set(DumpInner { tx, tap_tx });
+        false
+    };
 
-    let ok = DUMP.set(DumpInner { tx }).is_ok();
-    if ok {
-        tracing::info!(path = %dump_dir.display(), "audio dump: enabled");
-    }
-    ok
+    file_dump_enabled
+}
+
+/// Get the dump base directory (parent of timestamped dump dirs).
+/// Returns None if `AUDIO_DUMP_DIR` is not set.
+pub fn dump_base_dir() -> Option<PathBuf> {
+    std::env::var("AUDIO_DUMP_DIR")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .map(PathBuf::from)
+}
+
+/// Subscribe to the real-time audio tap broadcast.
+/// Returns None if dump system is not initialized.
+pub fn tap_subscribe() -> Option<tokio::sync::broadcast::Receiver<TapMessage>> {
+    DUMP.get().map(|inner| inner.tap_tx.subscribe())
 }
 
 /// Write audio samples to a named tap. Non-blocking; no-op when dump is disabled.
 pub fn write(tap: &'static str, samples: &[f32], sample_rate: u32) {
     if let Some(inner) = DUMP.get() {
+        let timestamp = elapsed_secs();
+
+        // File dump (if writer thread is running)
         let _ = inner.tx.send(DumpMsg::Audio {
             tap,
             samples: samples.to_vec(),
             sample_rate,
+        });
+
+        // Real-time tap broadcast (non-blocking, dropped if no subscribers)
+        let _ = inner.tap_tx.send(TapMessage::Audio {
+            tap,
+            samples: samples.to_vec(),
+            sample_rate,
+            timestamp,
         });
     }
 }
@@ -72,10 +138,25 @@ pub fn write(tap: &'static str, samples: &[f32], sample_rate: u32) {
 /// Append a CSV line to the VAD metadata file. Non-blocking; no-op when dump is disabled.
 pub fn write_vad_meta(line: &str) {
     if let Some(inner) = DUMP.get() {
+        let timestamp = elapsed_secs();
+
         let _ = inner.tx.send(DumpMsg::VadMeta {
             line: line.to_string(),
         });
+
+        let _ = inner.tap_tx.send(TapMessage::VadMeta {
+            data: line.to_string(),
+            timestamp,
+        });
     }
+}
+
+/// Monotonic elapsed seconds since dump init.
+fn elapsed_secs() -> f64 {
+    DUMP_START
+        .get()
+        .map(|t| t.elapsed().as_secs_f64())
+        .unwrap_or(0.0)
 }
 
 /// Flush all writers and shut down the background thread. Blocks until complete.

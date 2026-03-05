@@ -6,6 +6,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 
+use crate::audio_utils::Resampler;
 use crate::cloud;
 use crate::cloud::traits::{RecognizerConfig, SpeechRecognizer};
 use crate::protocol::{Event, SttConfig};
@@ -16,8 +17,11 @@ use super::{AudioFrame, VadEvent};
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
 
+/// Cloud/local STT always receives 16kHz audio (downsampled from pipeline rate).
+const STT_SAMPLE_RATE: u32 = 16000;
+
 pub enum Control {
-    StartCloud(SttConfig, u32),
+    StartCloud(SttConfig),
     StartLocal { model_path: std::path::PathBuf, language: String },
     Stop,
     Shutdown,
@@ -29,10 +33,10 @@ pub struct Handle {
 }
 
 impl Handle {
-    pub async fn start_cloud(&self, config: SttConfig, sample_rate: u32) {
+    pub async fn start_cloud(&self, config: SttConfig) {
         let _ = self
             .control_tx
-            .send(Control::StartCloud(config, sample_rate))
+            .send(Control::StartCloud(config))
             .await;
     }
 
@@ -81,9 +85,17 @@ pub fn spawn(
         let mut speech_start_time: Option<Instant> = None;
         let mut capture_start_time: Option<Instant> = None;
 
+        // Resample 48kHz pipeline audio to 16kHz for STT providers
+        let mut stt_resampler = Resampler::new(48000, STT_SAMPLE_RATE);
+
+        // Diagnostics
+        let mut audio_frame_count: u64 = 0;
+        let mut audio_sample_count: u64 = 0;
+        let mut stt_sample_count: u64 = 0;
+        let mut last_stats = Instant::now();
+
         // Retry state for cloud reconnection
         let mut cloud_config: Option<SttConfig> = None;
-        let mut cloud_sample_rate: u32 = 16000;
         let mut retry_delay = INITIAL_RETRY_DELAY;
         let mut retry_timer: Option<std::pin::Pin<Box<Sleep>>> = None;
 
@@ -91,14 +103,14 @@ pub fn spawn(
             tokio::select! {
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
-                        Control::StartCloud(stt_config, sample_rate) => {
+                        Control::StartCloud(stt_config) => {
                             // Store config for reconnection
                             cloud_config = Some(stt_config.clone());
-                            cloud_sample_rate = sample_rate;
                             retry_delay = INITIAL_RETRY_DELAY;
                             retry_timer = None;
+                            stt_resampler.reset();
 
-                            match try_start_cloud(&stt_config, sample_rate).await {
+                            match try_start_cloud(&stt_config).await {
                                 Ok(recognizer) => {
                                     cloud_recognizer = Some(recognizer);
                                     using_cloud = true;
@@ -127,6 +139,7 @@ pub fn spawn(
                                     using_cloud = false;
                                     cloud_config = None;
                                     retry_timer = None;
+                                    stt_resampler.reset();
                                     capture_start_time = Some(Instant::now());
                                     tracing::info!("STT node: local Whisper started");
                                 }
@@ -191,7 +204,7 @@ pub fn spawn(
                             delay_secs = retry_delay.as_secs(),
                             "STT node: attempting cloud reconnection"
                         );
-                        match try_start_cloud(cfg, cloud_sample_rate).await {
+                        match try_start_cloud(cfg).await {
                             Ok(recognizer) => {
                                 cloud_recognizer = Some(recognizer);
                                 retry_delay = INITIAL_RETRY_DELAY;
@@ -214,11 +227,34 @@ pub fn spawn(
 
                 // Process audio frames (with VAD state attached)
                 Some(frame) = audio_rx.recv() => {
+                    audio_frame_count += 1;
+                    audio_sample_count += frame.samples.len() as u64;
+
+                    // Downsample 48kHz→16kHz for STT providers
+                    let stt_samples = stt_resampler.process(&frame.samples);
+                    stt_sample_count += stt_samples.len() as u64;
+
+                    // Periodic diagnostics
+                    if last_stats.elapsed() >= Duration::from_secs(5) {
+                        tracing::debug!(
+                            audio_frames = audio_frame_count,
+                            audio_samples = audio_sample_count,
+                            stt_samples = stt_sample_count,
+                            input_sr = frame.sample_rate,
+                            last_frame_len = frame.samples.len(),
+                            last_stt_len = stt_samples.len(),
+                            using_cloud,
+                            has_recognizer = cloud_recognizer.is_some(),
+                            "STT node: stats"
+                        );
+                        last_stats = Instant::now();
+                    }
+
                     // Cloud streaming STT: feed all audio continuously.
                     // VAD state is available via frame.vad for future use.
                     if using_cloud {
                         if let Some(ref mut recognizer) = cloud_recognizer {
-                            if let Err(e) = recognizer.feed_audio(&frame.samples).await {
+                            if let Err(e) = recognizer.feed_audio(&stt_samples).await {
                                 tracing::error!(%e, "STT node: cloud connection lost");
                                 let _ = event_tx.send(Event::Error {
                                     message: format!("cloud STT disconnected: {e}"),
@@ -230,9 +266,9 @@ pub fn spawn(
                         }
                     }
 
-                    // Local Whisper: accumulate only during speech (VAD-gated)
+                    // Local Whisper: accumulate 16kHz audio during speech (VAD-gated)
                     if !using_cloud && was_speaking {
-                        speech_buffer.extend_from_slice(&frame.samples);
+                        speech_buffer.extend_from_slice(&stt_samples);
                     }
                 }
 
@@ -310,9 +346,9 @@ pub fn spawn(
 }
 
 /// Create and start a cloud recognizer from config.
+/// Always starts at STT_SAMPLE_RATE (16kHz) — the STT node handles downsampling.
 async fn try_start_cloud(
     stt_config: &SttConfig,
-    sample_rate: u32,
 ) -> Result<Box<dyn SpeechRecognizer>> {
     let provider = stt_config.provider.as_str();
     let model = stt_config
@@ -334,7 +370,7 @@ async fn try_start_cloud(
             .languages
             .clone()
             .unwrap_or_else(|| vec!["en".to_string()]),
-        sample_rate,
+        sample_rate: STT_SAMPLE_RATE,
         extra: stt_config.extra.clone().unwrap_or_default(),
     };
     recognizer.start(&config).await?;

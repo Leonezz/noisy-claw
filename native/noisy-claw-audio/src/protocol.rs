@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+/// Internal pipeline sample rate. All nodes process audio at this rate.
+pub const PIPELINE_SAMPLE_RATE: u32 = 48000;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct SttConfig {
     pub provider: String,
@@ -70,7 +73,7 @@ fn default_device() -> String {
 }
 
 fn default_sample_rate() -> u32 {
-    16000
+    PIPELINE_SAMPLE_RATE
 }
 
 #[derive(Debug, Serialize)]
@@ -124,7 +127,7 @@ mod tests {
         match cmd {
             Command::StartCapture { device, sample_rate, stt } => {
                 assert_eq!(device, "default");
-                assert_eq!(sample_rate, 16000);
+                assert_eq!(sample_rate, PIPELINE_SAMPLE_RATE);
                 assert!(stt.is_none());
             }
             _ => panic!("expected StartCapture"),

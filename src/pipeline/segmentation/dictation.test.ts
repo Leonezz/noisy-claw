@@ -111,6 +111,60 @@ describe("DictationSegmentation", () => {
     );
   });
 
+  it("matches end phrase with trailing punctuation", () => {
+    const seg = new DictationSegmentation();
+    const cb = vi.fn();
+    seg.onMessage(cb);
+
+    seg.onTranscript(makeSegment("Hello world", 0, 1));
+    seg.onTranscript(makeSegment("结束听写。", 1, 2));
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    // "结束听写。" is entirely an end phrase — stripped text is empty,
+    // so only "Hello world" (endTime=1) is in the buffer.
+    expect(cb).toHaveBeenCalledWith(
+      "Hello world",
+      expect.objectContaining({ startTime: 0, endTime: 1 }),
+    );
+  });
+
+  it("matches English end phrase with trailing period", () => {
+    const seg = new DictationSegmentation();
+    const cb = vi.fn();
+    seg.onMessage(cb);
+
+    seg.onTranscript(makeSegment("Take notes please", 0, 1));
+    seg.onTranscript(makeSegment("that is all end dictation.", 1, 2));
+
+    expect(cb).toHaveBeenCalledTimes(1);
+    expect(cb).toHaveBeenCalledWith(
+      "Take notes please that is all",
+      expect.any(Object),
+    );
+  });
+
+  it("fires onComplete callback when end phrase detected", () => {
+    const seg = new DictationSegmentation();
+    const completeCb = vi.fn();
+    seg.onComplete(completeCb);
+
+    seg.onTranscript(makeSegment("Hello world", 0, 1));
+    expect(completeCb).not.toHaveBeenCalled();
+
+    seg.onTranscript(makeSegment("done end dictation", 1, 2));
+    expect(completeCb).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not fire onComplete on flush", () => {
+    const seg = new DictationSegmentation();
+    const completeCb = vi.fn();
+    seg.onComplete(completeCb);
+
+    seg.onTranscript(makeSegment("Hello world", 0, 1));
+    seg.flush();
+    expect(completeCb).not.toHaveBeenCalled();
+  });
+
   it("clears buffer after emit", () => {
     const seg = new DictationSegmentation();
     const cb = vi.fn();

@@ -151,7 +151,7 @@ def main():
     else:
         taps_meta = {}
 
-    def get_sr(tap: str, default: int = 16000) -> int:
+    def get_sr(tap: str, default: int = 48000) -> int:
         return taps_meta.get(tap, {}).get("sample_rate", default)
 
     # Define tap layout

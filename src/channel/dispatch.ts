@@ -45,7 +45,8 @@ export async function dispatchVoiceTranscript(
         ? `[Meeting transcript block]: ${transcript}`
         : `[Voice input from microphone]: ${transcript}`;
 
-  const ttsEnabled = mode === "conversation" || mode === "meeting-keyword";
+  // TTS is opt-in via the voice_speak tool; auto-TTS only for keyword-addressed meeting input
+  const ttsEnabled = mode === "meeting-keyword";
 
   const msgCtx = {
     Body: transcript,

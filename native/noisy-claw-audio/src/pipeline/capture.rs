@@ -53,7 +53,7 @@ pub fn spawn(audio_tx: mpsc::UnboundedSender<AudioFrame>) -> Handle {
     let join = tokio::spawn(async move {
         let mut capture = AudioCapture::new();
         let mut frame_rx: Option<mpsc::UnboundedReceiver<Vec<f32>>> = None;
-        let mut current_sample_rate: u32 = 16000;
+        let mut current_sample_rate: u32 = crate::protocol::PIPELINE_SAMPLE_RATE;
         tracing::info!("capture node: task started");
 
         loop {

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
+use crate::audio_utils::Resampler;
 use crate::protocol::Event;
 use crate::vad::{VadWindowResult, VoiceActivityDetector};
 
@@ -127,6 +128,9 @@ pub fn spawn(
         let mut vad = vad;
         tracing::info!("VAD node: task started");
 
+        // Resample 48kHz pipeline audio to 16kHz for Silero VAD inference
+        let mut vad_resampler = Resampler::new(48000, 16000);
+
         let mut consecutive_speech_frames: u32 = 0;
         let mut consecutive_silence_frames: u32 = 0;
         let mut was_speaking = false;
@@ -158,6 +162,7 @@ pub fn spawn(
                             if let Some(ref mut v) = vad {
                                 v.reset();
                             }
+                            vad_resampler.reset();
                             consecutive_speech_frames = 0;
                             consecutive_silence_frames = 0;
                             was_speaking = false;
@@ -210,9 +215,12 @@ pub fn spawn(
                     }
                     prev_speaking_tts = speaking_tts;
 
-                    // Run VAD inference first to get per-frame state
+                    // Downsample 48kHz→16kHz for VAD inference (Silero expects 16kHz)
+                    let vad_samples = vad_resampler.process(&frame.samples);
+
+                    // Run VAD inference on 16kHz audio
                     let (max_speech_prob, any_is_speech) = if let Some(ref mut v) = vad {
-                        match v.process(&frame.samples) {
+                        match v.process(&vad_samples) {
                             Ok(results) => {
                                 let mut max_prob: f32 = 0.0;
                                 let mut any_speech = false;

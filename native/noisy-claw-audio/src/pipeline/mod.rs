@@ -3,6 +3,7 @@ pub mod capture;
 pub mod dump;
 pub mod output;
 pub mod stt;
+pub mod tap;
 pub mod topic;
 pub mod tts;
 pub mod vad;

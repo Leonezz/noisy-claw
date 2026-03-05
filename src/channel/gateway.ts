@@ -27,6 +27,8 @@ let activeSubprocess: AudioSubprocess | null = null;
 let injectedRuntime: PluginRuntime | null = null;
 let injectedStateDir: string | null = null;
 let activeVoiceConfig: VoiceConfig | null = null;
+/** Mode to return to when meeting/dictation completes. */
+let previousMode: VoiceMode = "conversation";
 
 export function getActivePipeline(): PipelineCoordinator | null {
   return activePipeline;
@@ -74,6 +76,13 @@ function createSegmentation(mode: VoiceMode, config: VoiceConfig): SegmentationE
 
 export function switchMode(mode: VoiceMode): void {
   if (!activeSession || !activePipeline || !activeSubprocess || !activeVoiceConfig) return;
+
+  // Save current mode so meeting/dictation can return to it on completion
+  const currentMode = activeSession.getState().mode;
+  if (mode === "meeting" || mode === "dictation") {
+    previousMode = currentMode;
+  }
+
   const seg = createSegmentation(mode, activeVoiceConfig);
   activePipeline.swapSegmentation(seg);
 
@@ -101,6 +110,20 @@ export function switchMode(mode: VoiceMode): void {
         });
       });
     }
+
+    // Auto-return to previous mode when meeting auto-stops (prolonged silence)
+    seg.onAutoStop(() => {
+      console.log(`[noisy-claw] meeting auto-stopped, returning to ${previousMode} mode`);
+      switchMode(previousMode);
+    });
+  }
+
+  // Wire dictation completion → return to previous mode
+  if (seg instanceof DictationSegmentation) {
+    seg.onComplete(() => {
+      console.log(`[noisy-claw] dictation completed, returning to ${previousMode} mode`);
+      switchMode(previousMode);
+    });
   }
 
   activeSubprocess.send({ cmd: "set_mode", mode });
@@ -236,9 +259,10 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     activePipeline = pipeline;
     activeSubprocess = subprocess;
 
-    // Wire message callback to track segments and dispatch to agent
+    // Wire message callback to track segments, log transcript, and dispatch to agent
     pipeline.onMessage((message, metadata) => {
       session.update(session.incrementSegments());
+      session.logTranscript(message, metadata.startTime, metadata.endTime);
 
       if (!injectedRuntime) {
         console.warn("[noisy-claw] transcript received but no runtime injected, skipping dispatch");
@@ -268,7 +292,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     pipeline.start({
       audio: {
         device: config.audio.device ?? "default",
-        sampleRate: config.audio.sampleRate ?? 16000,
+        sampleRate: config.audio.sampleRate ?? 48000,
       },
       stt: {
         model: config.stt?.model ?? "base",
@@ -299,6 +323,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
           activeSession = null;
           activeSubprocess = null;
           activeVoiceConfig = null;
+          previousMode = "conversation";
           resolve();
         },
         { once: true },
@@ -313,6 +338,7 @@ export const voiceGatewayAdapter: ChannelGatewayAdapter<ResolvedVoiceAccount> = 
     activeSession = null;
     activeSubprocess = null;
     activeVoiceConfig = null;
+    previousMode = "conversation";
   },
 };
 

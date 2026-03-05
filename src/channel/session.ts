@@ -1,5 +1,13 @@
 export type VoiceMode = "conversation" | "meeting" | "dictation";
 
+export type TranscriptEntry = {
+  text: string;
+  mode: VoiceMode;
+  timestamp: number; // Unix timestamp ms
+  startTime: number; // audio start (seconds from capture start)
+  endTime: number; // audio end (seconds from capture start)
+};
+
 export type VoiceSessionState = {
   active: boolean;
   mode: VoiceMode;
@@ -20,6 +28,7 @@ const INITIAL_STATE: VoiceSessionState = {
 
 export class VoiceSession {
   private state: VoiceSessionState = { ...INITIAL_STATE };
+  private transcriptLog: TranscriptEntry[] = [];
 
   start(): VoiceSessionState {
     return {
@@ -68,5 +77,26 @@ export class VoiceSession {
 
   update(next: VoiceSessionState): void {
     this.state = next;
+  }
+
+  /** Append a transcript block to the session history. */
+  logTranscript(text: string, startTime: number, endTime: number): void {
+    this.transcriptLog.push({
+      text,
+      mode: this.state.mode,
+      timestamp: Date.now(),
+      startTime,
+      endTime,
+    });
+  }
+
+  /** Get the full transcript history for this session. */
+  getTranscriptHistory(): readonly TranscriptEntry[] {
+    return this.transcriptLog;
+  }
+
+  /** Clear transcript history (e.g., on session stop). */
+  clearTranscriptHistory(): void {
+    this.transcriptLog = [];
   }
 }
