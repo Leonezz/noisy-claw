@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useMemo } from 'react'
 import {
   ReactFlow,
   type Node,
@@ -202,44 +202,11 @@ function buildEdges(def: PipelineDefinition): Edge[] {
 // ── Main component ──────────────────────────────────────────────
 
 interface PipelineGraphProps {
-  onPipeline: (cb: (data: PipelineData) => void) => () => void
-  fetchPipeline: () => void
-  subscribePipelineSnapshots: (intervalMs?: number) => void
-  unsubscribePipelineSnapshots: () => void
-  connected: boolean
+  pipelineData: PipelineData
+  onNodeSelect?: (name: string | null) => void
 }
 
-export function PipelineGraph({
-  onPipeline,
-  fetchPipeline,
-  subscribePipelineSnapshots,
-  unsubscribePipelineSnapshots,
-  connected,
-}: PipelineGraphProps) {
-  const [pipelineData, setPipelineData] = useState<PipelineData>({
-    definition: null,
-    snapshot: null,
-  })
-
-  // Subscribe to pipeline updates
-  useEffect(() => {
-    const unsub = onPipeline((data) => {
-      setPipelineData(data)
-    })
-    return unsub
-  }, [onPipeline])
-
-  // Fetch pipeline definition on connect, subscribe to snapshots
-  useEffect(() => {
-    if (connected) {
-      fetchPipeline()
-      subscribePipelineSnapshots(2000)
-      return () => {
-        unsubscribePipelineSnapshots()
-      }
-    }
-  }, [connected, fetchPipeline, subscribePipelineSnapshots, unsubscribePipelineSnapshots])
-
+export function PipelineGraph({ pipelineData, onNodeSelect }: PipelineGraphProps) {
   const nodes = useMemo(() => {
     if (!pipelineData.definition) return []
     return layoutNodes(pipelineData.definition, pipelineData.snapshot)
@@ -252,36 +219,51 @@ export function PipelineGraph({
 
   const onNodesChange = useCallback(() => {}, [])
 
+  const onNodeClick = useCallback(
+    (_: React.MouseEvent, node: Node) => {
+      onNodeSelect?.(node.id)
+    },
+    [onNodeSelect],
+  )
+
+  const onPaneClick = useCallback(() => {
+    onNodeSelect?.(null)
+  }, [onNodeSelect])
+
   if (!pipelineData.definition) {
     return (
-      <div className="flex items-center justify-center h-[500px] text-gray-500 text-sm">
-        {connected ? 'Loading pipeline...' : 'Connect to view pipeline graph'}
+      <div className="flex items-center justify-center h-full text-gray-500 text-sm">
+        Loading pipeline...
       </div>
     )
   }
 
   return (
-    <div className="h-[500px] rounded-lg border border-gray-800 bg-gray-950">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        nodeTypes={nodeTypes}
-        onNodesChange={onNodesChange}
-        fitView
-        proOptions={{ hideAttribution: true }}
-        defaultEdgeOptions={{ animated: true }}
-      >
-        <Background color="#1e293b" gap={20} />
-        <Controls
-          showInteractive={false}
-          className="!bg-gray-800 !border-gray-700 !shadow-lg [&>button]:!bg-gray-800 [&>button]:!border-gray-700 [&>button]:!fill-gray-400"
-        />
-        <MiniMap
-          nodeColor={(n) => getNodeColor((n.data as PipelineNodeData)?.nodeType ?? '')}
-          maskColor="rgba(0,0,0,0.7)"
-          className="!bg-gray-900 !border-gray-800"
-        />
-      </ReactFlow>
+    <div className="h-full flex flex-col rounded-lg border border-gray-800 bg-gray-950">
+      <div className="flex-1">
+        <ReactFlow
+          nodes={nodes}
+          edges={edges}
+          nodeTypes={nodeTypes}
+          onNodesChange={onNodesChange}
+          onNodeClick={onNodeClick}
+          onPaneClick={onPaneClick}
+          fitView
+          proOptions={{ hideAttribution: true }}
+          defaultEdgeOptions={{ animated: true }}
+        >
+          <Background color="#1e293b" gap={20} />
+          <Controls
+            showInteractive={false}
+            className="!bg-gray-800 !border-gray-700 !shadow-lg [&>button]:!bg-gray-800 [&>button]:!border-gray-700 [&>button]:!fill-gray-400"
+          />
+          <MiniMap
+            nodeColor={(n) => getNodeColor((n.data as PipelineNodeData)?.nodeType ?? '')}
+            maskColor="rgba(0,0,0,0.7)"
+            className="!bg-gray-900 !border-gray-800"
+          />
+        </ReactFlow>
+      </div>
 
       {/* Status bar */}
       <div className="flex items-center gap-4 px-3 py-1.5 text-[10px] text-gray-500 border-t border-gray-800">
