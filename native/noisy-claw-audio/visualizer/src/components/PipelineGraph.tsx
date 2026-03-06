@@ -13,29 +13,7 @@ import {
 } from '@xyflow/react'
 import '@xyflow/react/dist/style.css'
 import type { PipelineData, PipelineDefinition, PipelineSnapshot } from '../lib/protocol'
-
-// ── Node type colors ──────────────────────────────────────────────
-
-const NODE_COLORS: Record<string, string> = {
-  capture: '#22c55e',  // green
-  aec: '#06b6d4',      // cyan
-  vad: '#f59e0b',      // amber
-  stt: '#8b5cf6',      // violet
-  tts: '#ec4899',      // pink
-  output: '#ef4444',   // red
-  topic: '#6366f1',    // indigo
-  ipc_sink: '#64748b', // slate
-}
-
-const STATUS_COLORS: Record<string, string> = {
-  Created: '#94a3b8',
-  Running: '#22c55e',
-  Stopped: '#ef4444',
-}
-
-function getNodeColor(nodeType: string): string {
-  return NODE_COLORS[nodeType] ?? '#94a3b8'
-}
+import { getNodeTypeColor, getStatusColor } from '../lib/colors'
 
 // ── Custom pipeline node component ──────────────────────────────
 
@@ -49,8 +27,8 @@ type PipelineNodeData = {
 }
 
 function PipelineNodeComponent({ data }: NodeProps<Node<PipelineNodeData>>) {
-  const color = getNodeColor(data.nodeType)
-  const statusColor = STATUS_COLORS[data.status] ?? '#94a3b8'
+  const color = getNodeTypeColor(data.nodeType)
+  const statusColor = getStatusColor(data.status)
 
   return (
     <div
@@ -130,54 +108,78 @@ const nodeTypes: NodeTypes = {
   pipeline: PipelineNodeComponent,
 }
 
-// ── Port metadata (mirrors Rust node port declarations) ──────────
-
-const PORT_INFO: Record<string, { inputs: string[]; outputs: string[] }> = {
-  capture:  { inputs: [],                          outputs: ['audio_out'] },
-  aec:      { inputs: ['capture_in', 'render_in'], outputs: ['audio_out'] },
-  vad:      { inputs: ['audio_in'],                outputs: ['audio_out', 'vad_event_out', 'ipc_event_out', 'barge_in_out'] },
-  stt:      { inputs: ['audio_in', 'vad_in'],      outputs: ['ipc_event_out'] },
-  tts:      { inputs: [],                          outputs: ['output_msg_out', 'ipc_event_out'] },
-  output:   { inputs: ['output_msg_in'],           outputs: ['render_ref_out'] },
-  topic:    { inputs: [],                          outputs: ['ipc_event_out'] },
-  ipc_sink: { inputs: ['event_in'],               outputs: [] },
-}
-
-// ── Layout: auto-position nodes in a pipeline-style layout ──────
-
-const LAYOUT_ORDER = ['capture', 'aec', 'vad', 'stt', 'tts', 'output', 'topic', 'ipc_sink']
+// ── Topological layout from link graph ──────────────────────────
 
 function layoutNodes(def: PipelineDefinition, snapshot: PipelineSnapshot | null): Node[] {
-  const sorted = [...def.nodes].sort((a, b) => {
-    const ai = LAYOUT_ORDER.indexOf(a.type)
-    const bi = LAYOUT_ORDER.indexOf(b.type)
-    return (ai === -1 ? 99 : ai) - (bi === -1 ? 99 : bi)
-  })
+  const nodeNames = def.nodes.map((n) => n.name)
+  const nodeMap = new Map(def.nodes.map((n) => [n.name, n]))
+  const nameSet = new Set(nodeNames)
 
-  // Arrange in two rows: audio path on top, support nodes below
-  const audioPath = ['capture', 'aec', 'vad', 'stt']
-  const supportRow = ['tts', 'output', 'topic', 'ipc_sink']
+  // Build unique node-level adjacency
+  const outEdges = new Map<string, Set<string>>()
+  const inEdges = new Map<string, Set<string>>()
+  for (const name of nodeNames) {
+    outEdges.set(name, new Set())
+    inEdges.set(name, new Set())
+  }
+  for (const link of def.links) {
+    const src = link.from.split(':')[0]
+    const dst = link.to.split(':')[0]
+    if (nameSet.has(src) && nameSet.has(dst)) {
+      outEdges.get(src)!.add(dst)
+      inEdges.get(dst)!.add(src)
+    }
+  }
 
-  return sorted.map((nd) => {
-    const snap = snapshot?.nodes[nd.name]
-    const ports = PORT_INFO[nd.type] ?? { inputs: [], outputs: [] }
-    const isAudioPath = audioPath.includes(nd.type)
-    const row = isAudioPath ? 0 : 1
-    const col = isAudioPath
-      ? audioPath.indexOf(nd.type)
-      : supportRow.indexOf(nd.type)
+  // Assign column = longest path from any source to this node
+  const col = new Map<string, number>()
+  function getCol(name: string, visited: Set<string>): number {
+    if (col.has(name)) return col.get(name)!
+    if (visited.has(name)) return 0
+    visited.add(name)
+    const preds = inEdges.get(name)
+    if (!preds || preds.size === 0) {
+      col.set(name, 0)
+      return 0
+    }
+    let maxPred = 0
+    for (const pred of preds) {
+      maxPred = Math.max(maxPred, getCol(pred, visited) + 1)
+    }
+    col.set(name, maxPred)
+    return maxPred
+  }
+  for (const name of nodeNames) {
+    getCol(name, new Set())
+  }
+
+  // Group by column for row positioning
+  const byCol = new Map<number, string[]>()
+  for (const name of nodeNames) {
+    const c = col.get(name) ?? 0
+    const group = byCol.get(c) ?? []
+    group.push(name)
+    byCol.set(c, group)
+  }
+
+  return nodeNames.map((name) => {
+    const nd = nodeMap.get(name)!
+    const snap = snapshot?.nodes[name]
+    const ports = nd.ports ?? []
+    const c = col.get(name) ?? 0
+    const row = byCol.get(c)!.indexOf(name)
 
     return {
-      id: nd.name,
+      id: name,
       type: 'pipeline',
-      position: { x: col * 220 + 40, y: row * 180 + 40 },
+      position: { x: c * 220 + 40, y: row * 180 + 40 },
       data: {
-        label: nd.name,
+        label: name,
         nodeType: nd.type,
         status: snap?.status ?? 'Created',
         properties: snap?.properties ?? nd.properties,
-        inputPorts: ports.inputs,
-        outputPorts: ports.outputs,
+        inputPorts: ports.filter((p) => p.direction === 'in').map((p) => p.name),
+        outputPorts: ports.filter((p) => p.direction === 'out').map((p) => p.name),
       } satisfies PipelineNodeData,
     }
   })
@@ -258,7 +260,7 @@ export function PipelineGraph({ pipelineData, onNodeSelect }: PipelineGraphProps
             className="!bg-gray-800 !border-gray-700 !shadow-lg [&>button]:!bg-gray-800 [&>button]:!border-gray-700 [&>button]:!fill-gray-400"
           />
           <MiniMap
-            nodeColor={(n) => getNodeColor((n.data as PipelineNodeData)?.nodeType ?? '')}
+            nodeColor={(n) => getNodeTypeColor((n.data as PipelineNodeData)?.nodeType ?? '')}
             maskColor="rgba(0,0,0,0.7)"
             className="!bg-gray-900 !border-gray-800"
           />

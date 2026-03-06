@@ -3,7 +3,8 @@ import { useTapSocket } from './hooks/useTapSocket'
 import { WaveformCanvas } from './components/WaveformCanvas'
 import { LevelMeter } from './components/LevelMeter'
 import { VadPanel } from './components/VadPanel'
-import { TapSelector, getTapColor } from './components/TapSelector'
+import { TapSelector } from './components/TapSelector'
+import { getTapColor } from './lib/colors'
 import { DumpBrowser } from './components/DumpBrowser'
 import { PipelineGraph } from './components/PipelineGraph'
 import { NodeInspector } from './components/NodeInspector'
@@ -54,7 +55,7 @@ export function App() {
     connected,
     availableTaps,
     onFrame,
-    onVadMeta,
+    onMetadata,
     onPipeline,
     sendCommand,
     fetchPipeline,
@@ -238,7 +239,7 @@ export function App() {
             </div>
 
             {/* VAD panel */}
-            <VadPanel onVadMeta={onVadMeta} />
+            <VadPanel onMetadata={onMetadata} />
 
             {/* Node metrics */}
             <NodeMetricsGrid pipelineData={pipelineData} />

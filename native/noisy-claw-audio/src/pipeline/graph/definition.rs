@@ -3,6 +3,8 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
+use super::types::PortDescriptor;
+
 /// JSON-serializable pipeline definition.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PipelineDefinition {
@@ -11,6 +13,9 @@ pub struct PipelineDefinition {
     pub links: Vec<LinkDefinition>,
     #[serde(default)]
     pub modes: HashMap<String, HashMap<String, serde_json::Value>>,
+    /// Data stream descriptors — populated at build time from node traits.
+    #[serde(default, skip_deserializing)]
+    pub data_streams: Vec<DataStreamDescriptor>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -20,6 +25,9 @@ pub struct NodeDefinition {
     pub node_type: String,
     #[serde(default = "default_properties")]
     pub properties: serde_json::Value,
+    /// Port descriptors — populated at build time from the node trait.
+    #[serde(default, skip_deserializing)]
+    pub ports: Vec<PortDescriptor>,
 }
 
 fn default_properties() -> serde_json::Value {
@@ -30,6 +38,43 @@ fn default_properties() -> serde_json::Value {
 pub struct LinkDefinition {
     pub from: String,
     pub to: String,
+}
+
+// ── Data stream descriptors ─────────────────────────────────
+
+/// Describes a data stream emitted by the pipeline.
+///
+/// The Rust side describes WHAT data it sends (type, format, fields);
+/// the frontend decides HOW to visualize it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DataStreamDescriptor {
+    /// Raw audio samples streamed via binary WebSocket frames.
+    Audio {
+        /// Tap name (matches the tap name in binary audio frames).
+        name: String,
+        /// Sample rate in Hz.
+        sample_rate: u32,
+    },
+    /// Structured metadata events streamed as JSON text frames.
+    Metadata {
+        /// Stream name (used as the "stream" field in metadata messages).
+        name: String,
+        /// Field descriptors for the structured data.
+        fields: Vec<FieldDescriptor>,
+    },
+    /// Text events (e.g., transcription results).
+    Text {
+        /// Stream name.
+        name: String,
+    },
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct FieldDescriptor {
+    pub name: String,
+    /// Type hint: "f64", "bool", "string", "u32"
+    pub field_type: String,
 }
 
 /// Parse a port reference like "mic:audio_out" into (node_name, port_name).

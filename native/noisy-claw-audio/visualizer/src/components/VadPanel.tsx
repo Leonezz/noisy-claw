@@ -1,9 +1,9 @@
 import { useEffect, useRef } from 'react'
-import type { VadMeta } from '../lib/protocol'
+import type { MetadataEvent } from '../lib/protocol'
 import { useECharts } from '../hooks/useECharts'
 
 interface VadPanelProps {
-  onVadMeta: (listener: (meta: VadMeta) => void) => () => void
+  onMetadata: (listener: (meta: MetadataEvent) => void) => () => void
   height?: number
   durationSec?: number
 }
@@ -17,16 +17,16 @@ interface VadPoint {
   wasSpeaking: boolean
 }
 
-function parseCsv(data: string): VadPoint | null {
-  const parts = data.trim().split(',')
-  if (parts.length < 6) return null
+function parseFields(fields: Record<string, unknown>): VadPoint | null {
+  const speechProb = typeof fields.speech_prob === 'number' ? fields.speech_prob : null
+  if (speechProb === null) return null
   return {
-    timestamp: parseFloat(parts[0]) / 1000, // ms -> sec
-    speechProb: parseFloat(parts[1]),
-    isSpeech: parts[2] === '1',
-    speakingTts: parts[3] === '1',
-    blanking: parseInt(parts[4]),
-    wasSpeaking: parts[5] === '1',
+    timestamp: 0, // overwritten by event timestamp
+    speechProb,
+    isSpeech: fields.is_speech === true,
+    speakingTts: fields.speaking_tts === true,
+    blanking: typeof fields.blanking === 'number' ? fields.blanking : 0,
+    wasSpeaking: fields.was_speaking === true,
   }
 }
 
@@ -50,15 +50,16 @@ function computeRanges(
   return ranges
 }
 
-export function VadPanel({ onVadMeta, height = 140, durationSec = 10 }: VadPanelProps) {
+export function VadPanel({ onMetadata, height = 140, durationSec = 10 }: VadPanelProps) {
   const containerRef = useRef<HTMLDivElement>(null)
   const pointsRef = useRef<VadPoint[]>([])
   const chart = useECharts(containerRef)
 
-  // Subscribe to VAD metadata
+  // Subscribe to VAD metadata stream
   useEffect(() => {
-    return onVadMeta((meta) => {
-      const point = parseCsv(meta.data)
+    return onMetadata((meta) => {
+      if (meta.stream !== 'vad') return
+      const point = parseFields(meta.fields)
       if (!point) return
       point.timestamp = meta.timestamp
       pointsRef.current.push(point)
@@ -67,7 +68,7 @@ export function VadPanel({ onVadMeta, height = 140, durationSec = 10 }: VadPanel
         pointsRef.current.shift()
       }
     })
-  }, [onVadMeta, durationSec])
+  }, [onMetadata, durationSec])
 
   // Initial chart config
   useEffect(() => {

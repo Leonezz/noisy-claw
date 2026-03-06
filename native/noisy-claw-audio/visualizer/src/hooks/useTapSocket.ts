@@ -1,10 +1,10 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { type AudioFrame, type VadMeta, type DumpEntry, type PipelineData, parseAudioFrame } from '../lib/protocol'
+import { type AudioFrame, type MetadataEvent, type DumpEntry, type PipelineData, parseAudioFrame } from '../lib/protocol'
 
 export interface TapState {
   connected: boolean
   frames: Map<string, AudioFrame[]>
-  vadMeta: VadMeta[]
+  metadata: MetadataEvent[]
   levels: Map<string, number>
   availableTaps: Set<string>
 }
@@ -26,10 +26,10 @@ export function useTapSocket({
   const [availableTaps, setAvailableTaps] = useState<Set<string>>(new Set())
   const wsRef = useRef<WebSocket | null>(null)
   const framesRef = useRef<Map<string, AudioFrame[]>>(new Map())
-  const vadMetaRef = useRef<VadMeta[]>([])
+  const metadataRef = useRef<MetadataEvent[]>([])
   const levelsRef = useRef<Map<string, number>>(new Map())
   const listenersRef = useRef<Set<(tap: string, frame: AudioFrame) => void>>(new Set())
-  const vadListenersRef = useRef<Set<(meta: VadMeta) => void>>(new Set())
+  const metadataListenersRef = useRef<Set<(meta: MetadataEvent) => void>>(new Set())
   const pipelineListenersRef = useRef<Set<(data: PipelineData) => void>>(new Set())
   const pipelineRef = useRef<PipelineData>({ definition: null, snapshot: null })
   const pausedRef = useRef(paused)
@@ -86,13 +86,13 @@ export function useTapSocket({
       } else if (typeof event.data === 'string') {
         try {
           const msg = JSON.parse(event.data)
-          if (msg.type === 'vad_meta') {
-            const meta: VadMeta = msg
-            vadMetaRef.current.push(meta)
-            if (vadMetaRef.current.length > 1000) {
-              vadMetaRef.current.splice(0, vadMetaRef.current.length - 1000)
+          if (msg.type === 'metadata') {
+            const meta: MetadataEvent = msg
+            metadataRef.current.push(meta)
+            if (metadataRef.current.length > 1000) {
+              metadataRef.current.splice(0, metadataRef.current.length - 1000)
             }
-            for (const listener of vadListenersRef.current) {
+            for (const listener of metadataListenersRef.current) {
               listener(meta)
             }
           } else if (msg.type === 'pipeline') {
@@ -137,11 +137,11 @@ export function useTapSocket({
     [],
   )
 
-  const onVadMeta = useCallback(
-    (listener: (meta: VadMeta) => void) => {
-      vadListenersRef.current.add(listener)
+  const onMetadata = useCallback(
+    (listener: (meta: MetadataEvent) => void) => {
+      metadataListenersRef.current.add(listener)
       return () => {
-        vadListenersRef.current.delete(listener)
+        metadataListenersRef.current.delete(listener)
       }
     },
     [],
@@ -250,10 +250,10 @@ export function useTapSocket({
     connected,
     availableTaps,
     framesRef,
-    vadMetaRef,
+    metadataRef,
     levelsRef,
     onFrame,
-    onVadMeta,
+    onMetadata,
     onPipeline,
     sendCommand,
     fetchPipeline,

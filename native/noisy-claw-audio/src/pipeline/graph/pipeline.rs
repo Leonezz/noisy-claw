@@ -55,7 +55,15 @@ impl Pipeline {
     /// Build a pipeline from a parsed definition.
     pub fn from_definition(def: &PipelineDefinition) -> Result<Self> {
         let builder = PipelineBuilder::new(def)?;
-        let built = builder.build()?;
+        let mut built = builder.build()?;
+
+        // Populate port descriptors on the definition from actual node implementations
+        for node_def in &mut built.definition.nodes {
+            if let Some(node) = built.nodes.get(&node_def.name) {
+                node_def.ports = node.ports();
+            }
+        }
+
         Ok(Self {
             nodes: built.nodes,
             handles: HashMap::new(),

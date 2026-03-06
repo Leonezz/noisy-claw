@@ -340,6 +340,7 @@ mod tests {
             nodes: vec![],
             links: vec![],
             modes: HashMap::new(),
+            data_streams: vec![],
         };
         let result = PipelineBuilder::new(&def);
         assert!(result.is_ok());
@@ -353,9 +354,11 @@ mod tests {
                 name: "x".to_string(),
                 node_type: "nonexistent".to_string(),
                 properties: serde_json::json!({}),
+                ports: vec![],
             }],
             links: vec![],
             modes: HashMap::new(),
+            data_streams: vec![],
         };
         let result = PipelineBuilder::new(&def);
         assert!(result.is_err());

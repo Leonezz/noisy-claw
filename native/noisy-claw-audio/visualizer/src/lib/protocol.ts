@@ -7,10 +7,11 @@ export interface AudioFrame {
   samples: Float32Array
 }
 
-/** Parsed VAD metadata from the tap server (text frame). */
-export interface VadMeta {
-  type: 'vad_meta'
-  data: string
+/** Structured metadata event from the tap server (text frame). */
+export interface MetadataEvent {
+  type: 'metadata'
+  stream: string
+  fields: Record<string, unknown>
   timestamp: number
 }
 
@@ -77,14 +78,25 @@ export function rmsToDb(rms: number): number {
 
 export interface PortDescriptor {
   name: string
-  port_type: 'Audio' | 'VadEvent' | 'OutputMsg' | 'IpcEvent' | 'Signal'
-  direction: 'In' | 'Out'
+  port_type: 'audio' | 'vad_event' | 'output_msg' | 'ipc_event' | 'signal'
+  direction: 'in' | 'out'
 }
+
+export interface FieldDescriptor {
+  name: string
+  field_type: string
+}
+
+export type DataStreamDescriptor =
+  | { kind: 'audio'; name: string; sample_rate: number }
+  | { kind: 'metadata'; name: string; fields: FieldDescriptor[] }
+  | { kind: 'text'; name: string }
 
 export interface NodeDefinition {
   name: string
   type: string
   properties: Record<string, unknown>
+  ports?: PortDescriptor[]
 }
 
 export interface LinkDefinition {
@@ -97,6 +109,7 @@ export interface PipelineDefinition {
   nodes: NodeDefinition[]
   links: LinkDefinition[]
   modes: Record<string, Record<string, unknown>>
+  data_streams?: DataStreamDescriptor[]
 }
 
 export interface NodeSnapshot {

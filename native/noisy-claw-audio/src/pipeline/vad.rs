@@ -261,15 +261,14 @@ pub fn spawn(
                     let results = std::mem::take(&mut vad_results_buf);
 
                     for w in results {
-                        dump::write_vad_meta(&format!(
-                            "{:.1},{:.4},{},{},{},{}\n",
-                            first_audio_time.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0),
-                            w.speech_prob,
-                            w.is_speech as u8,
-                            speaking_tts as u8,
-                            blanking_countdown,
-                            was_speaking as u8
-                        ));
+                        dump::write_metadata("vad", serde_json::json!({
+                            "elapsed_ms": first_audio_time.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0),
+                            "speech_prob": w.speech_prob,
+                            "is_speech": w.is_speech,
+                            "speaking_tts": speaking_tts,
+                            "blanking": blanking_countdown,
+                            "was_speaking": was_speaking,
+                        }));
 
                         // Blanking: suppress VAD events during comfort blanking
                         // (TTS start) or post-flush settling. Must run in ALL

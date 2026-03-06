@@ -1,21 +1,5 @@
 import type { PipelineData } from '../lib/protocol'
-
-const NODE_COLORS: Record<string, string> = {
-  capture: '#22c55e',
-  aec: '#06b6d4',
-  vad: '#f59e0b',
-  stt: '#8b5cf6',
-  tts: '#ec4899',
-  output: '#ef4444',
-  topic: '#6366f1',
-  ipc_sink: '#64748b',
-}
-
-const STATUS_COLORS: Record<string, string> = {
-  Created: '#94a3b8',
-  Running: '#22c55e',
-  Stopped: '#ef4444',
-}
+import { getNodeTypeColor, getStatusColor } from '../lib/colors'
 
 interface NodeMetricsGridProps {
   pipelineData: PipelineData
@@ -31,9 +15,9 @@ export function NodeMetricsGrid({ pipelineData }: NodeMetricsGridProps) {
       <div className="grid grid-cols-4 gap-2">
         {definition.nodes.map((node) => {
           const snap = snapshot?.nodes[node.name]
-          const color = NODE_COLORS[node.type] ?? '#94a3b8'
+          const color = getNodeTypeColor(node.type)
           const status = snap?.status ?? 'Created'
-          const statusColor = STATUS_COLORS[status] ?? '#94a3b8'
+          const statusColor = getStatusColor(status)
 
           return (
             <div

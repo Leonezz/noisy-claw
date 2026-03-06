@@ -19,8 +19,9 @@ pub enum TapMessage {
         /// Monotonic timestamp in seconds since dump init (pipeline start).
         timestamp: f64,
     },
-    VadMeta {
-        data: String,
+    Metadata {
+        stream: &'static str,
+        fields: serde_json::Value,
         timestamp: f64,
     },
 }
@@ -36,8 +37,9 @@ enum DumpMsg {
         samples: Vec<f32>,
         sample_rate: u32,
     },
-    VadMeta {
-        line: String,
+    Metadata {
+        stream: &'static str,
+        data: String,
     },
     Finish,
 }
@@ -135,17 +137,19 @@ pub fn write(tap: &'static str, samples: &[f32], sample_rate: u32) {
     }
 }
 
-/// Append a CSV line to the VAD metadata file. Non-blocking; no-op when dump is disabled.
-pub fn write_vad_meta(line: &str) {
+/// Write structured metadata to a named stream. Non-blocking; no-op when dump is disabled.
+pub fn write_metadata(stream: &'static str, fields: serde_json::Value) {
     if let Some(inner) = DUMP.get() {
         let timestamp = elapsed_secs();
 
-        let _ = inner.tx.send(DumpMsg::VadMeta {
-            line: line.to_string(),
+        let _ = inner.tx.send(DumpMsg::Metadata {
+            stream,
+            data: fields.to_string(),
         });
 
-        let _ = inner.tap_tx.send(TapMessage::VadMeta {
-            data: line.to_string(),
+        let _ = inner.tap_tx.send(TapMessage::Metadata {
+            stream,
+            fields,
             timestamp,
         });
     }
@@ -220,21 +224,7 @@ fn writer_thread(rx: mpsc::Receiver<DumpMsg>, dir: PathBuf) {
     let mut writers: HashMap<&'static str, BufWriter<File>> = HashMap::new();
     let mut sample_rates: HashMap<&'static str, u32> = HashMap::new();
 
-    let vad_meta_path = dir.join("vad_meta.csv");
-    let mut vad_meta_writer = match File::create(&vad_meta_path) {
-        Ok(f) => {
-            let mut w = BufWriter::new(f);
-            let _ = writeln!(
-                w,
-                "elapsed_ms,speech_prob,is_speech,speaking_tts,blanking,was_speaking"
-            );
-            Some(w)
-        }
-        Err(e) => {
-            tracing::error!(%e, "audio dump: failed to create vad_meta.csv");
-            None
-        }
-    };
+    let mut metadata_writers: HashMap<&'static str, BufWriter<File>> = HashMap::new();
 
     for msg in rx {
         match msg {
@@ -257,18 +247,22 @@ fn writer_thread(rx: mpsc::Receiver<DumpMsg>, dir: PathBuf) {
                     let _ = writer.write_all(&s.to_le_bytes());
                 }
             }
-            DumpMsg::VadMeta { line } => {
-                if let Some(ref mut w) = vad_meta_writer {
-                    let _ = w.write_all(line.as_bytes());
-                }
+            DumpMsg::Metadata { stream, data } => {
+                let writer = metadata_writers.entry(stream).or_insert_with(|| {
+                    let path = dir.join(format!("{stream}.jsonl"));
+                    let file = File::create(&path)
+                        .expect("audio dump: failed to create metadata file");
+                    BufWriter::new(file)
+                });
+                let _ = writeln!(writer, "{data}");
             }
             DumpMsg::Finish => {
                 // Flush all PCM writers
                 for (_, mut w) in writers.drain() {
                     let _ = w.flush();
                 }
-                // Flush VAD meta
-                if let Some(ref mut w) = vad_meta_writer {
+                // Flush metadata writers
+                for (_, mut w) in metadata_writers.drain() {
                     let _ = w.flush();
                 }
 
@@ -310,7 +304,7 @@ mod tests {
     fn write_is_noop_when_uninitialized() {
         // Should not panic or block
         write("test_tap", &[0.1, 0.2, 0.3], 16000);
-        write_vad_meta("test,0.5,1,0,0,0\n");
+        write_metadata("test", serde_json::json!({"value": 1}));
     }
 
     #[test]

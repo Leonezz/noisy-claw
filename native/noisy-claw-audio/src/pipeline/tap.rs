@@ -185,12 +185,13 @@ async fn handle_connection(
                                     }
                                 }
                             }
-                            TapMessage::VadMeta { data, timestamp } => {
-                                if subscribe_all || subscriptions.contains("vad_meta") {
+                            TapMessage::Metadata { stream, fields, timestamp } => {
+                                if subscribe_all || subscriptions.contains(*stream) || subscriptions.contains("metadata") {
                                     vad_msg_count += 1;
                                     let json = serde_json::json!({
-                                        "type": "vad_meta",
-                                        "data": data,
+                                        "type": "metadata",
+                                        "stream": stream,
+                                        "fields": fields,
                                         "timestamp": timestamp,
                                     });
                                     if ws_tx.send(Message::Text(json.to_string().into())).await.is_err() {

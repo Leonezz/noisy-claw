@@ -1,5 +1,6 @@
 import { useCallback, useState } from 'react'
 import type { NodeDefinition, NodeSnapshot } from '../lib/protocol'
+import { getStatusColor } from '../lib/colors'
 
 interface NodeInspectorProps {
   nodeName: string
@@ -7,12 +8,6 @@ interface NodeInspectorProps {
   snapshot?: NodeSnapshot
   onPropertyChange: (node: string, key: string, value: unknown) => void
   onClose: () => void
-}
-
-const STATUS_COLORS: Record<string, string> = {
-  Created: '#94a3b8',
-  Running: '#22c55e',
-  Stopped: '#ef4444',
 }
 
 export function NodeInspector({
@@ -39,7 +34,7 @@ export function NodeInspector({
         <div className="flex items-center gap-2 flex-shrink-0">
           <span
             className="w-2.5 h-2.5 rounded-full"
-            style={{ backgroundColor: STATUS_COLORS[status] ?? '#94a3b8' }}
+            style={{ backgroundColor: getStatusColor(status) }}
             title={status}
           />
           <button
