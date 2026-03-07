@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import type { AudioFrame } from '../lib/protocol'
 import { useECharts } from '../hooks/useECharts'
 import { envelope } from '../lib/downsample'
+import { useTheme, getTokens } from '../lib/theme'
 
 interface WaveformCanvasProps {
   tap: string
@@ -22,6 +23,8 @@ export function WaveformCanvas({
   durationSec = 10,
   sampleRate = 48000,
 }: WaveformCanvasProps) {
+  const { theme } = useTheme()
+  const tk = getTokens(theme)
   const containerRef = useRef<HTMLDivElement>(null)
   const bufferRef = useRef<Float32Array>(new Float32Array(sampleRate * durationSec))
   const writeOffsetRef = useRef(0)
@@ -54,7 +57,7 @@ export function WaveformCanvas({
         top: 2,
         textStyle: { color, fontSize: 11, fontFamily: 'monospace', fontWeight: 'normal' },
       },
-      grid: { left: 0, right: 0, top: 0, bottom: 0 },
+      grid: { left: 0, right: 0, top: 20, bottom: 0 },
       xAxis: {
         type: 'value',
         show: false,
@@ -88,24 +91,29 @@ export function WaveformCanvas({
     })
   }, [tap, color, chart])
 
-  // Throttled chart update at ~15 fps
+  // Chart update via requestAnimationFrame (~60fps, throttled to ~20fps)
   useEffect(() => {
-    const interval = setInterval(() => {
+    let raf = 0
+    let lastTime = 0
+    const update = (time: number) => {
+      raf = requestAnimationFrame(update)
+      if (time - lastTime < 50) return // ~20fps throttle
+      lastTime = time
       const c = chart.current
       if (!c) return
       const env = envelope(bufferRef.current, writeOffsetRef.current, NUM_BUCKETS)
       const data = env.map(([max, min], i) => [i, max, min])
       c.setOption({ series: [{ data }] })
-    }, 66)
-
-    return () => clearInterval(interval)
+    }
+    raf = requestAnimationFrame(update)
+    return () => cancelAnimationFrame(raf)
   }, [chart])
 
   return (
     <div
       ref={containerRef}
-      style={{ height }}
-      className="w-full rounded border border-gray-800"
+      style={{ height, border: `1px solid ${tk.borderPrimary}` }}
+      className="w-full rounded"
     />
   )
 }

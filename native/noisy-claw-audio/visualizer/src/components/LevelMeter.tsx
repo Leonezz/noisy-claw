@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import type { AudioFrame } from '../lib/protocol'
 import { rmsToDb } from '../lib/protocol'
+import { useTheme, getTokens } from '../lib/theme'
 
 interface LevelMeterProps {
   tap: string
@@ -9,6 +10,8 @@ interface LevelMeterProps {
 }
 
 export function LevelMeter({ tap, color, onFrame }: LevelMeterProps) {
+  const { theme } = useTheme()
+  const tk = getTokens(theme)
   const [db, setDb] = useState(-100)
   const rmsRef = useRef(0)
 
@@ -40,7 +43,7 @@ export function LevelMeter({ tap, color, onFrame }: LevelMeterProps) {
       <span className="w-20 truncate" style={{ color }}>
         {tap}
       </span>
-      <div className="flex-1 h-3 bg-gray-800 rounded overflow-hidden">
+      <div className="flex-1 h-3 rounded overflow-hidden" style={{ backgroundColor: tk.borderPrimary }}>
         <div
           className="h-full rounded transition-all duration-75"
           style={{
@@ -50,7 +53,7 @@ export function LevelMeter({ tap, color, onFrame }: LevelMeterProps) {
           }}
         />
       </div>
-      <span className="w-14 text-right text-gray-400">
+      <span className="w-14 text-right" style={{ color: tk.textTertiary }}>
         {db > -100 ? `${db.toFixed(1)}dB` : '-∞'}
       </span>
     </div>

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import type { DumpEntry } from '../lib/protocol'
 import { getTapColor } from './TapSelector'
+import { useTheme, getTokens } from '../lib/theme'
 
 interface DumpBrowserProps {
   listDumps: () => Promise<DumpEntry[]>
@@ -118,20 +119,24 @@ export function DumpBrowser({
     return `${seconds.toFixed(1)}s`
   }
 
+  const { theme } = useTheme()
+  const tk = getTokens(theme)
+
   return (
     <div className="space-y-2">
       <div className="flex items-center gap-2">
-        <h3 className="text-sm font-semibold text-gray-300">Dump Files</h3>
+        <h3 className="text-sm font-semibold" style={{ color: tk.textSecondary }}>Dump Files</h3>
         <button
           onClick={refreshDumps}
-          className="text-xs px-2 py-0.5 bg-gray-800 rounded border border-gray-700 hover:bg-gray-700"
+          className="text-xs px-2 py-0.5 rounded transition-colors"
+          style={{ backgroundColor: tk.bgSurface, border: `1px solid ${tk.borderPrimary}`, color: tk.textSecondary }}
         >
           Refresh
         </button>
       </div>
 
       {dumps.length === 0 ? (
-        <p className="text-xs text-gray-500">
+        <p className="text-xs" style={{ color: tk.textTertiary }}>
           No dumps found. Set AUDIO_DUMP_DIR to enable.
         </p>
       ) : (
@@ -140,11 +145,12 @@ export function DumpBrowser({
             <button
               key={dump.name}
               onClick={() => selectDump(dump.name)}
-              className={`text-xs px-2 py-1 rounded border font-mono ${
-                selectedDump === dump.name
-                  ? 'border-blue-500 bg-blue-900/30 text-blue-300'
-                  : 'border-gray-700 bg-gray-900 text-gray-400 hover:bg-gray-800'
-              }`}
+              className="text-xs px-2 py-1 rounded border font-mono transition-colors"
+              style={{
+                borderColor: selectedDump === dump.name ? tk.accentInfo : tk.borderPrimary,
+                backgroundColor: selectedDump === dump.name ? tk.accentInfoBg : tk.bgPage,
+                color: selectedDump === dump.name ? tk.accentInfo : tk.textTertiary,
+              }}
             >
               {dump.name.replace('dump_', '')}
             </button>
@@ -167,14 +173,14 @@ export function DumpBrowser({
                   key={file.name}
                   onClick={() => playFile(file.name)}
                   disabled={loading && isPlaying}
-                  className={`flex items-center justify-between px-2 py-1 text-xs font-mono rounded border ${
-                    isPlaying
-                      ? 'border-green-500 bg-green-900/30'
-                      : 'border-gray-700 bg-gray-900 hover:bg-gray-800'
-                  }`}
+                  className="flex items-center justify-between px-2 py-1 text-xs font-mono rounded border transition-colors"
+                  style={{
+                    borderColor: isPlaying ? tk.accentGreen : tk.borderPrimary,
+                    backgroundColor: isPlaying ? tk.accentGreenBg : tk.bgPage,
+                  }}
                 >
                   <span style={{ color }}>{tap}</span>
-                  <span className="text-gray-500">
+                  <span style={{ color: tk.textTertiary }}>
                     {formatSize(file.size)} / {formatDuration(file.size)}
                   </span>
                 </button>

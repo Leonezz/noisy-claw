@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { type AudioFrame, type MetadataEvent, type DumpEntry, type PipelineData, parseAudioFrame } from '../lib/protocol'
+import { type AudioFrame, type MetadataEvent, type DumpEntry, type PipelineData, type NodeTypeInfo, parseAudioFrame } from '../lib/protocol'
 
 export interface TapState {
   connected: boolean
@@ -111,6 +111,15 @@ export function useTapSocket({
             for (const listener of pipelineListenersRef.current) {
               listener(pipelineRef.current)
             }
+          } else if (msg.type === 'load_pipeline_result' && msg.ok) {
+            // Pipeline was reloaded — re-fetch definition + snapshot
+            ws.send(JSON.stringify({ get_pipeline: true }))
+          } else if (msg.type === 'send_command_result' && msg.ok) {
+            // Node command succeeded — refresh snapshot
+            ws.send(JSON.stringify({ get_pipeline: true }))
+          } else if (msg.type === 'set_property_result' || msg.type === 'set_mode_result') {
+            // Property or mode changed — refresh snapshot immediately
+            ws.send(JSON.stringify({ get_pipeline: true }))
           }
         } catch {
           // ignore non-JSON text
@@ -246,6 +255,44 @@ export function useTapSocket({
     [],
   )
 
+  const sendNodeCommand = useCallback(
+    (node: string, cmd: string, args: Record<string, unknown> = {}) => {
+      sendCommand({ send_command: { node, cmd, args } })
+    },
+    [sendCommand],
+  )
+
+  const fetchNodeTypes = useCallback((): Promise<NodeTypeInfo[]> => {
+    return new Promise((resolve) => {
+      const ws = wsRef.current
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        resolve([])
+        return
+      }
+
+      const handler = (event: MessageEvent) => {
+        if (typeof event.data === 'string') {
+          try {
+            const msg = JSON.parse(event.data)
+            if (msg.type === 'node_types') {
+              ws.removeEventListener('message', handler)
+              resolve(msg.node_types as NodeTypeInfo[])
+            }
+          } catch {
+            /* ignore */
+          }
+        }
+      }
+      ws.addEventListener('message', handler)
+      ws.send(JSON.stringify({ get_node_types: true }))
+
+      setTimeout(() => {
+        ws.removeEventListener('message', handler)
+        resolve([])
+      }, 5000)
+    })
+  }, [])
+
   return {
     connected,
     availableTaps,
@@ -256,7 +303,9 @@ export function useTapSocket({
     onMetadata,
     onPipeline,
     sendCommand,
+    sendNodeCommand,
     fetchPipeline,
+    fetchNodeTypes,
     subscribePipelineSnapshots,
     unsubscribePipelineSnapshots,
     listDumps,

@@ -1,4 +1,5 @@
 import { getTapColor } from '../lib/colors'
+import { useTheme, getTokens } from '../lib/theme'
 
 interface TapSelectorProps {
   availableTaps: Set<string>
@@ -9,6 +10,8 @@ interface TapSelectorProps {
 export { getTapColor }
 
 export function TapSelector({ availableTaps, selectedTaps, onToggle }: TapSelectorProps) {
+  const { theme } = useTheme()
+  const tk = getTokens(theme)
   const taps = Array.from(availableTaps).sort()
 
   return (
@@ -20,12 +23,13 @@ export function TapSelector({ availableTaps, selectedTaps, onToggle }: TapSelect
           <button
             key={tap}
             onClick={() => onToggle(tap)}
-            className={`px-2 py-1 text-xs font-mono rounded border transition-colors ${
-              active
-                ? 'border-current bg-gray-800'
-                : 'border-gray-700 bg-gray-900 opacity-50'
-            }`}
-            style={{ color }}
+            className="px-2 py-1 text-xs font-mono rounded border transition-colors"
+            style={{
+              color,
+              borderColor: active ? color : tk.borderPrimary,
+              backgroundColor: active ? tk.bgSurface : tk.bgPage,
+              opacity: active ? 1 : 0.5,
+            }}
           >
             {tap}
           </button>

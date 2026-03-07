@@ -14,6 +14,7 @@ const STATUS_COLORS: Record<string, string> = {
   running: '#22c55e',
   stopped: '#ef4444',
   paused: '#f59e0b',
+  error: '#ef4444',
 }
 
 const typeColorMap = new Map<string, string>()

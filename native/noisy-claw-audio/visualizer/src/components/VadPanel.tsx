@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import type { MetadataEvent } from '../lib/protocol'
 import { useECharts } from '../hooks/useECharts'
+import { useTheme, getTokens } from '../lib/theme'
 
 interface VadPanelProps {
   onMetadata: (listener: (meta: MetadataEvent) => void) => () => void
@@ -51,6 +52,8 @@ function computeRanges(
 }
 
 export function VadPanel({ onMetadata, height = 140, durationSec = 10 }: VadPanelProps) {
+  const { theme } = useTheme()
+  const tk = getTokens(theme)
   const containerRef = useRef<HTMLDivElement>(null)
   const pointsRef = useRef<VadPoint[]>([])
   const chart = useECharts(containerRef)
@@ -82,9 +85,9 @@ export function VadPanel({ onMetadata, height = 140, durationSec = 10 }: VadPane
       },
       tooltip: {
         trigger: 'axis',
-        backgroundColor: 'rgba(0,0,0,0.8)',
-        borderColor: '#333',
-        textStyle: { color: '#ccc', fontSize: 11 },
+        backgroundColor: theme === 'dark' ? 'rgba(0,0,0,0.8)' : 'rgba(255,255,255,0.9)',
+        borderColor: tk.borderSecondary,
+        textStyle: { color: tk.textSecondary, fontSize: 11 },
         formatter: (params: any) => {
           const p = Array.isArray(params) ? params[0] : params
           if (!p?.value) return ''
@@ -106,16 +109,16 @@ export function VadPanel({ onMetadata, height = 140, durationSec = 10 }: VadPane
         splitNumber: 2,
         axisLabel: {
           formatter: (v: number) => v.toFixed(1),
-          color: '#666',
+          color: tk.textMuted,
           fontSize: 10,
           fontFamily: 'monospace',
         },
-        splitLine: { lineStyle: { color: '#1e293b' } },
+        splitLine: { lineStyle: { color: tk.borderPrimary } },
       },
       legend: {
         right: 10,
         top: 0,
-        textStyle: { color: '#999', fontSize: 10 },
+        textStyle: { color: tk.textTertiary, fontSize: 10 },
         itemWidth: 12,
         itemHeight: 8,
       },
@@ -131,7 +134,7 @@ export function VadPanel({ onMetadata, height = 140, durationSec = 10 }: VadPane
           markLine: {
             silent: true,
             symbol: 'none',
-            lineStyle: { color: '#666', type: 'dashed' },
+            lineStyle: { color: tk.textMuted, type: 'dashed' },
             data: [{ yAxis: 0.5 }],
             label: { show: false },
           },
@@ -144,7 +147,7 @@ export function VadPanel({ onMetadata, height = 140, durationSec = 10 }: VadPane
         { name: 'blanking', type: 'line', data: [], symbol: 'none', lineStyle: { color: 'rgba(234,179,8,0.5)', width: 4 }, itemStyle: { color: 'rgba(234,179,8,0.5)' } },
       ],
     })
-  }, [chart])
+  }, [chart, theme, tk])
 
   // Throttled chart update at ~10 fps
   useEffect(() => {
@@ -186,8 +189,8 @@ export function VadPanel({ onMetadata, height = 140, durationSec = 10 }: VadPane
   return (
     <div
       ref={containerRef}
-      style={{ height }}
-      className="w-full rounded border border-gray-800"
+      style={{ height, border: `1px solid ${tk.borderPrimary}` }}
+      className="w-full rounded"
     />
   )
 }

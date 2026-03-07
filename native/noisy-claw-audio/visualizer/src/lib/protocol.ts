@@ -78,7 +78,7 @@ export function rmsToDb(rms: number): number {
 
 export interface PortDescriptor {
   name: string
-  port_type: 'audio' | 'vad_event' | 'output_msg' | 'ipc_event' | 'signal'
+  port_type: 'audio' | 'output_msg' | 'ipc_event' | 'state'
   direction: 'in' | 'out'
 }
 
@@ -88,9 +88,9 @@ export interface FieldDescriptor {
 }
 
 export type DataStreamDescriptor =
-  | { kind: 'audio'; name: string; sample_rate: number }
-  | { kind: 'metadata'; name: string; fields: FieldDescriptor[] }
-  | { kind: 'text'; name: string }
+  | { kind: 'audio'; name: string; sample_rate: number; node?: string }
+  | { kind: 'metadata'; name: string; fields: FieldDescriptor[]; node?: string }
+  | { kind: 'text'; name: string; node?: string }
 
 export interface NodeDefinition {
   name: string
@@ -114,9 +114,10 @@ export interface PipelineDefinition {
 
 export interface NodeSnapshot {
   node_type: string
-  status: string
+  status: string | { status: string; message?: string }
   properties: Record<string, unknown>
   metrics: Record<string, unknown>
+  last_error?: string
 }
 
 export interface PipelineSnapshot {
@@ -128,4 +129,11 @@ export interface PipelineSnapshot {
 export interface PipelineData {
   definition: PipelineDefinition | null
   snapshot: PipelineSnapshot | null
+}
+
+/** Registered node type info from the backend registry. */
+export interface NodeTypeInfo {
+  node_type: string
+  description: string
+  ports: PortDescriptor[]
 }

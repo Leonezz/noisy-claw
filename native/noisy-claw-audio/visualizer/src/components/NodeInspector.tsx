@@ -17,7 +17,10 @@ export function NodeInspector({
   onPropertyChange,
   onClose,
 }: NodeInspectorProps) {
-  const status = snapshot?.status ?? 'Created'
+  const rawStatus = snapshot?.status
+  const status =
+    typeof rawStatus === 'object' ? rawStatus?.status ?? 'Created' :
+    rawStatus ?? 'Created'
   const properties = snapshot?.properties ?? definition?.properties ?? {}
   const metrics = snapshot?.metrics ?? {}
 
