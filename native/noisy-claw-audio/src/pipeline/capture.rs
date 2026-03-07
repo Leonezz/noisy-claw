@@ -95,6 +95,7 @@ pub fn spawn(audio_tx: mpsc::UnboundedSender<AudioFrame>) -> Handle {
                         None => std::future::pending().await,
                     }
                 } => {
+                    super::dump::write("capture", &samples, current_sample_rate);
                     let _ = audio_tx.send(AudioFrame {
                         samples,
                         sample_rate: current_sample_rate,

@@ -1,9 +1,11 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
+use crate::pipeline::graph::definition::DataStreamDescriptor;
 use crate::pipeline::graph::node::{NodeHandle, PipelineNode};
 use crate::pipeline::graph::registry::NodeFactoryEntry;
 use crate::pipeline::graph::types::{
@@ -11,14 +13,16 @@ use crate::pipeline::graph::types::{
     PropertyDescriptor, PropertyMap,
 };
 use crate::pipeline::graph::wiring::{InputEndpoint, NodeWiring, OutputEndpoint};
-use crate::pipeline::{
-    output, AudioFrame, FlushAck, FlushSignal, NodeId, OutputMessage, OutputNodeEvent,
-};
+use crate::pipeline::{output, AudioFrame, FlushAck, FlushSignal, NodeId, OutputMessage};
+use crate::protocol::Event;
 
 pub struct OutputNode {
     output_msg_in: Option<mpsc::UnboundedReceiver<OutputMessage>>,
+    user_speaking_in: Option<watch::Receiver<bool>>,
     render_ref_out: Option<OutputEndpoint>,
-    speak_done_rx: Option<mpsc::Receiver<OutputNodeEvent>>,
+    ipc_event_out: Option<OutputEndpoint>,
+    speaker_active_tx: Option<Arc<watch::Sender<bool>>>,
+    speaker_active_rx: Option<watch::Receiver<bool>>,
     inner: Option<output::Handle>,
     status: NodeStatus,
 }
@@ -27,8 +31,11 @@ impl OutputNode {
     pub fn new(_props: &serde_json::Value) -> Result<Self> {
         Ok(Self {
             output_msg_in: None,
+            user_speaking_in: None,
             render_ref_out: None,
-            speak_done_rx: None,
+            ipc_event_out: None,
+            speaker_active_tx: None,
+            speaker_active_rx: None,
             inner: None,
             status: NodeStatus::Created,
         })
@@ -36,9 +43,9 @@ impl OutputNode {
 
     pub fn inner(&self) -> Option<&output::Handle> { self.inner.as_ref() }
 
-    /// Take the internal SpeakDone receiver. Call after start().
-    pub fn take_speak_done_rx(&mut self) -> Option<mpsc::Receiver<OutputNodeEvent>> {
-        self.speak_done_rx.take()
+    /// Take a speaker_active watch receiver for external observation. Call after start().
+    pub fn take_speaker_active_rx(&mut self) -> Option<watch::Receiver<bool>> {
+        self.speaker_active_rx.take()
     }
 }
 
@@ -49,6 +56,10 @@ impl NodeWiring for OutputNode {
                 InputEndpoint::OutputMsg(rx) => { self.output_msg_in = Some(rx); Ok(()) }
                 _ => Err(anyhow!("output_msg_in expects OutputMsg")),
             },
+            "user_speaking_in" => match ep {
+                InputEndpoint::State(rx) => { self.user_speaking_in = Some(rx); Ok(()) }
+                _ => Err(anyhow!("user_speaking_in expects State")),
+            },
             _ => Err(anyhow!("output: unknown input '{port}'")),
         }
     }
@@ -56,6 +67,11 @@ impl NodeWiring for OutputNode {
     fn set_output(&mut self, port: &str, ep: OutputEndpoint) -> Result<()> {
         match port {
             "render_ref_out" => { self.render_ref_out = Some(ep); Ok(()) }
+            "ipc_event_out" => { self.ipc_event_out = Some(ep); Ok(()) }
+            "speaker_active_out" => match ep {
+                OutputEndpoint::State(tx) => { self.speaker_active_tx = Some(Arc::new(tx)); Ok(()) }
+                _ => Err(anyhow!("speaker_active_out expects State")),
+            },
             _ => Err(anyhow!("output: unknown output '{port}'")),
         }
     }
@@ -65,16 +81,41 @@ impl NodeWiring for OutputNode {
 impl PipelineNode for OutputNode {
     fn node_type(&self) -> &'static str { "output" }
 
+    fn data_streams(&self) -> Vec<DataStreamDescriptor> {
+        vec![DataStreamDescriptor::Audio {
+            name: "tts_out".into(),
+            sample_rate: 24000,
+            node: None,
+        }]
+    }
+
     fn ports(&self) -> Vec<PortDescriptor> { output_ports() }
     fn property_descriptors(&self) -> Vec<PropertyDescriptor> { vec![] }
     fn update(&mut self, _props: &PropertyMap) -> Result<()> { Ok(()) }
 
+    async fn command(&mut self, cmd: &str, _args: serde_json::Value) -> Result<serde_json::Value> {
+        match cmd {
+            "status" => {
+                let speaking = self.speaker_active_tx.as_ref()
+                    .map(|tx| *tx.borrow())
+                    .unwrap_or(false);
+                Ok(serde_json::json!({ "speaking": speaking }))
+            }
+            _ => Err(anyhow!("output: unknown command: {cmd}")),
+        }
+    }
+
     fn snapshot(&self) -> NodeSnapshot {
+        let mut p = serde_json::Map::new();
+        if let Some(ref tx) = self.speaker_active_tx {
+            p.insert("speaker_active".into(), serde_json::json!(*tx.borrow()));
+        }
         NodeSnapshot {
             node_type: "output".to_string(),
             status: self.status.clone(),
-            properties: serde_json::Map::new(),
+            properties: p,
             metrics: HashMap::new(),
+            last_error: None,
         }
     }
 
@@ -99,11 +140,24 @@ impl PipelineNode for OutputNode {
             while let Some(f) = ref_rx.recv().await { render_out.send(f); }
         });
 
-        // Internal SpeakDone channel (not a graph port)
-        let (internal_tx, internal_rx) = mpsc::channel::<OutputNodeEvent>(16);
-        self.speak_done_rx = Some(internal_rx);
+        // IPC event output: bounded → PortSender bridge
+        let (evt_tx, mut evt_rx) = mpsc::channel::<Event>(64);
+        if let Some(OutputEndpoint::IpcEvent(ipc_out)) = self.ipc_event_out.take() {
+            tokio::spawn(async move {
+                while let Some(ev) = evt_rx.recv().await { ipc_out.send(ev); }
+            });
+        } else {
+            // Drop events when ipc_event_out is not wired
+            tokio::spawn(async move { while evt_rx.recv().await.is_some() {} });
+        }
 
-        let handle = output::spawn(msg_rx, ref_tx, internal_tx);
+        // Subscribe for external observation before passing sender to inner task
+        if let Some(ref tx) = self.speaker_active_tx {
+            self.speaker_active_rx = Some(tx.subscribe());
+        }
+
+        let user_speaking_rx = self.user_speaking_in.take();
+        let handle = output::spawn(msg_rx, ref_tx, evt_tx, self.speaker_active_tx.clone(), user_speaking_rx);
         self.inner = Some(handle);
         self.status = NodeStatus::Running;
         let (stx, _) = mpsc::channel(1);
@@ -129,7 +183,10 @@ impl PipelineNode for OutputNode {
 fn output_ports() -> Vec<PortDescriptor> {
     vec![
         PortDescriptor { name: Cow::Borrowed("output_msg_in"), port_type: PortType::OutputMsg, direction: Direction::In },
+        PortDescriptor { name: Cow::Borrowed("user_speaking_in"), port_type: PortType::State, direction: Direction::In },
         PortDescriptor { name: Cow::Borrowed("render_ref_out"), port_type: PortType::Audio, direction: Direction::Out },
+        PortDescriptor { name: Cow::Borrowed("ipc_event_out"), port_type: PortType::IpcEvent, direction: Direction::Out },
+        PortDescriptor { name: Cow::Borrowed("speaker_active_out"), port_type: PortType::State, direction: Direction::Out },
     ]
 }
 

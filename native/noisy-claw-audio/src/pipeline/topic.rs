@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use ndarray::Array1;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::embedding::SentenceEmbedder;
@@ -45,12 +45,8 @@ impl Handle {
 
 /// Spawn the topic detection node.
 ///
-/// Inputs (via `control_tx`):
-///   - Final transcripts from STT
-///   - VAD state updates
-///
-/// Outputs:
-///   - `event_tx`: emits `Event::TopicShift { similarity }` when a topic change is detected
+/// The node defers model loading until `enabled_rx` becomes `true`.
+/// While disabled, incoming transcripts are dropped.
 pub fn spawn(
     event_tx: mpsc::Sender<Event>,
     model_path: PathBuf,
@@ -58,36 +54,12 @@ pub fn spawn(
     similarity_threshold: f32,
     max_block_secs: f64,
     silence_block_secs: f64,
+    mut enabled_rx: watch::Receiver<bool>,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel::<Control>(64);
 
     let join = tokio::spawn(async move {
-        tracing::info!("Topic node: loading embedder");
-
-        let embedder = match tokio::task::spawn_blocking(move || {
-            SentenceEmbedder::new(&model_path, &tokenizer_path)
-        })
-        .await
-        {
-            Ok(Ok(e)) => e,
-            Ok(Err(e)) => {
-                tracing::error!(%e, "Topic node: failed to load embedder");
-                let _ = event_tx
-                    .send(Event::Error {
-                        message: format!("topic embedder init failed: {e}"),
-                    })
-                    .await;
-                return;
-            }
-            Err(e) => {
-                tracing::error!(%e, "Topic node: spawn_blocking panicked");
-                return;
-            }
-        };
-
-        tracing::info!("Topic node: embedder loaded, running");
-
-        let embedder = Arc::new(embedder);
+        let mut embedder: Option<Arc<SentenceEmbedder>> = None;
         let mut centroid: Option<Array1<f32>> = None;
         let mut topic_start = Instant::now();
         let mut last_speech_time = Instant::now();
@@ -104,11 +76,42 @@ pub fn spawn(
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
                         Control::Transcript { text } => {
+                            // Skip if not enabled
+                            if !*enabled_rx.borrow() {
+                                continue;
+                            }
+
+                            // Lazy-load model on first transcript when enabled
+                            if embedder.is_none() {
+                                tracing::info!("Topic node: loading embedder (lazy)");
+                                let mp = model_path.clone();
+                                let tp = tokenizer_path.clone();
+                                match tokio::task::spawn_blocking(move || {
+                                    SentenceEmbedder::new(&mp, &tp)
+                                }).await {
+                                    Ok(Ok(e)) => {
+                                        tracing::info!("Topic node: embedder loaded");
+                                        embedder = Some(Arc::new(e));
+                                    }
+                                    Ok(Err(e)) => {
+                                        tracing::error!(%e, "Topic node: failed to load embedder");
+                                        let _ = event_tx.send(Event::Error {
+                                            message: format!("topic embedder init failed: {e}"),
+                                        }).await;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(%e, "Topic node: spawn_blocking panicked");
+                                        continue;
+                                    }
+                                }
+                            }
+
+                            let emb_ref = embedder.as_ref().unwrap().clone();
                             let embedding = {
                                 let text_clone = text.clone();
-                                let emb = embedder.clone();
                                 match tokio::task::spawn_blocking(move || {
-                                    emb.embed(&text_clone)
+                                    emb_ref.embed(&text_clone)
                                 }).await {
                                     Ok(Ok(emb)) => emb,
                                     Ok(Err(e)) => {
@@ -194,9 +197,9 @@ pub fn spawn(
                     }
                 }
 
-                // Check time-based block emission every second
+                // Check time-based block emission every second (only when enabled + model loaded)
                 _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
-                    if centroid.is_none() {
+                    if !*enabled_rx.borrow() || centroid.is_none() {
                         continue;
                     }
 

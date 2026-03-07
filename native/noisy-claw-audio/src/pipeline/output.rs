@@ -1,12 +1,14 @@
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::output::StreamingOutput;
+use crate::protocol::Event;
 
-use super::{AudioFrame, FlushAck, FlushSignal, NodeId, OutputMessage, OutputNodeEvent, RequestId};
+use super::{AudioFrame, FlushAck, FlushSignal, NodeId, OutputMessage, RequestId};
 use super::dump;
 use tokio::sync::oneshot;
 
@@ -46,15 +48,19 @@ impl Handle {
 /// Spawn the output node.
 ///
 /// Input:
-///   - `msg_rx`:         OutputMessages from TtsNode / orchestrator
+///   - `msg_rx`:              OutputMessages from TtsNode
+///   - `user_speaking_rx`:    watch state from VadNode (for barge-in detection)
 ///
 /// Outputs:
-///   - `render_ref_tx`:  speaker reference audio → AecNode
-///   - `internal_tx`:    OutputNodeEvent::SpeakDone → orchestrator
+///   - `render_ref_tx`:       speaker reference audio → AecNode
+///   - `event_tx`:            IPC events (SpeakDone) → IpcSink
+///   - `speaker_active_tx`:   watch state → VAD (and pipeline)
 pub fn spawn(
     mut msg_rx: mpsc::Receiver<OutputMessage>,
     render_ref_tx: mpsc::UnboundedSender<AudioFrame>,
-    internal_tx: mpsc::Sender<OutputNodeEvent>,
+    event_tx: mpsc::Sender<Event>,
+    speaker_active_tx: Option<Arc<watch::Sender<bool>>>,
+    mut user_speaking_rx: Option<watch::Receiver<bool>>,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
@@ -64,6 +70,13 @@ pub fn spawn(
         let mut active_request_id: Option<RequestId> = None;
         // Handle for the render-reference forwarding task
         let mut ref_fwd_handle: Option<JoinHandle<()>> = None;
+
+        // Helper: update speaker_active state
+        let set_speaker_active = |active: bool| {
+            if let Some(ref tx) = speaker_active_tx {
+                let _ = tx.send(active);
+            }
+        };
 
         loop {
             tokio::select! {
@@ -82,6 +95,7 @@ pub fn spawn(
                             tracing::info!("output node: resumed");
                         }
                         Control::Flush { signal, reply } => {
+                            let req_id_str = active_request_id.as_ref().map(|r| r.0.clone());
                             if let Some(ref mut out) = streaming_output {
                                 out.stop();
                             }
@@ -89,12 +103,17 @@ pub fn spawn(
                             if let Some(h) = ref_fwd_handle.take() {
                                 h.abort();
                             }
-                            let req_id = match &signal {
+                            let ack_req_id = match &signal {
                                 FlushSignal::Flush { request_id } => Some(request_id.clone()),
                                 FlushSignal::FlushAll => None,
                             };
                             active_request_id = None;
-                            let _ = reply.send(FlushAck { node: NodeId::Output, request_id: req_id });
+                            set_speaker_active(false);
+                            let _ = event_tx.send(Event::SpeakDone {
+                                request_id: req_id_str,
+                                reason: "interrupted".to_string(),
+                            }).await;
+                            let _ = reply.send(FlushAck { node: NodeId::Output, request_id: ack_req_id });
                             tracing::info!("output node: flushed");
                         }
                         Control::Shutdown => {
@@ -105,9 +124,42 @@ pub fn spawn(
                             if let Some(h) = ref_fwd_handle.take() {
                                 h.abort();
                             }
+                            set_speaker_active(false);
                             tracing::info!("output node: shutdown");
                             break;
                         }
+                    }
+                }
+
+                // Barge-in: user speaking while output is active
+                _ = async {
+                    match user_speaking_rx.as_mut() {
+                        Some(rx) => rx.changed().await.ok(),
+                        None => std::future::pending::<Option<()>>().await,
+                    }
+                } => {
+                    let speaking = user_speaking_rx.as_ref()
+                        .map(|rx| *rx.borrow())
+                        .unwrap_or(false);
+                    let is_active = speaker_active_tx.as_ref()
+                        .map(|tx| *tx.borrow())
+                        .unwrap_or(false);
+                    if speaking && is_active {
+                        let req_id_str = active_request_id.as_ref().map(|r| r.0.clone());
+                        tracing::info!(?req_id_str, "output node: barge-in detected, stopping playback");
+                        if let Some(ref mut out) = streaming_output {
+                            out.stop();
+                        }
+                        streaming_output = None;
+                        if let Some(h) = ref_fwd_handle.take() {
+                            h.abort();
+                        }
+                        active_request_id = None;
+                        set_speaker_active(false);
+                        let _ = event_tx.send(Event::SpeakDone {
+                            request_id: req_id_str,
+                            reason: "interrupted".to_string(),
+                        }).await;
                     }
                 }
 
@@ -127,6 +179,7 @@ pub fn spawn(
                                 Ok((out, mut ref_rx)) => {
                                     let output_rate = out.sample_rate();
                                     streaming_output = Some(out);
+                                    set_speaker_active(true);
 
                                     // Spawn render-reference forwarder
                                     let ref_tx = render_ref_tx.clone();
@@ -187,25 +240,34 @@ pub fn spawn(
                                 // Spawn a non-blocking drain watcher so the select
                                 // loop stays responsive to Flush/Shutdown controls
                                 let playing = out.playing_flag();
-                                let drain_tx = internal_tx.clone();
+                                let sa_tx = speaker_active_tx.as_ref().map(Arc::clone);
+                                let ev_tx = event_tx.clone();
+                                let req_id_str = request_id.0.clone();
                                 tokio::spawn(async move {
                                     while playing.load(Ordering::SeqCst) {
                                         tokio::time::sleep(Duration::from_millis(50)).await;
                                     }
+                                    if let Some(ref tx) = sa_tx {
+                                        let _ = tx.send(false);
+                                    }
                                     tracing::info!("output node: buffer drained");
-                                    let _ = drain_tx.send(OutputNodeEvent::SpeakDone).await;
+                                    let _ = ev_tx.send(Event::SpeakDone {
+                                        request_id: Some(req_id_str),
+                                        reason: "completed".to_string(),
+                                    }).await;
                                 });
                             } else {
-                                let _ = internal_tx.send(OutputNodeEvent::SpeakDone).await;
+                                set_speaker_active(false);
+                                let _ = event_tx.send(Event::SpeakDone {
+                                    request_id: Some(request_id.0.clone()),
+                                    reason: "completed".to_string(),
+                                }).await;
                             }
 
                             // Clean up — keep streaming_output alive for the drain
                             // watcher to read the playing flag; Flush/StopAll will
                             // clear it immediately if a barge-in occurs.
                             active_request_id = None;
-                            // Note: streaming_output and ref_fwd_handle are NOT
-                            // cleaned up here — they will be cleaned up by the next
-                            // StartSession, Flush, StopAll, or Shutdown handler.
                         }
 
                         OutputMessage::StopSession { request_id } => {
@@ -213,26 +275,38 @@ pub fn spawn(
                                 tracing::debug!(?request_id, "output node: ignoring stale StopSession");
                                 continue;
                             }
+                            let req_id_str = request_id.0.clone();
                             if let Some(ref mut out) = streaming_output {
                                 out.stop();
                             }
                             streaming_output = None;
                             active_request_id = None;
+                            set_speaker_active(false);
                             if let Some(h) = ref_fwd_handle.take() {
                                 h.abort();
                             }
+                            let _ = event_tx.send(Event::SpeakDone {
+                                request_id: Some(req_id_str),
+                                reason: "stopped".to_string(),
+                            }).await;
                             tracing::info!("output node: session stopped (interrupted)");
                         }
 
                         OutputMessage::StopAll => {
+                            let req_id_str = active_request_id.as_ref().map(|r| r.0.clone());
                             if let Some(ref mut out) = streaming_output {
                                 out.stop();
                             }
                             streaming_output = None;
                             active_request_id = None;
+                            set_speaker_active(false);
                             if let Some(h) = ref_fwd_handle.take() {
                                 h.abort();
                             }
+                            let _ = event_tx.send(Event::SpeakDone {
+                                request_id: req_id_str,
+                                reason: "stopped".to_string(),
+                            }).await;
                             tracing::info!("output node: all sessions stopped");
                         }
                     }

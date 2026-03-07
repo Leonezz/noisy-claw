@@ -3,6 +3,7 @@ use std::any::Any;
 use anyhow::Result;
 use tokio::sync::mpsc;
 
+use super::definition::DataStreamDescriptor;
 use super::types::{NodeSnapshot, PortDescriptor, PropertyDescriptor, PropertyMap};
 use super::wiring::NodeWiring;
 use crate::pipeline::{FlushAck, FlushSignal};
@@ -44,6 +45,12 @@ pub trait PipelineNode: NodeWiring + Send + 'static {
     /// Declare configurable properties with types and defaults.
     fn property_descriptors(&self) -> Vec<PropertyDescriptor>;
 
+    /// Declare data streams this node emits for visualization.
+    /// The frontend uses these descriptors to choose appropriate visualizations.
+    fn data_streams(&self) -> Vec<DataStreamDescriptor> {
+        vec![]
+    }
+
     /// Apply property updates. Called on mode switch, user tuning, etc.
     fn update(&mut self, properties: &PropertyMap) -> Result<()>;
 
@@ -53,6 +60,12 @@ pub trait PipelineNode: NodeWiring + Send + 'static {
     /// Spawn the node's internal task/thread. Returns a handle for shutdown.
     /// The node decides its own execution model internally.
     async fn start(&mut self) -> Result<NodeHandle>;
+
+    /// Handle a node-specific command (e.g., "start", "stop", "speak").
+    /// Default implementation rejects all commands.
+    async fn command(&mut self, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        Err(anyhow::anyhow!("{}: unsupported command: {cmd}", self.node_type()))
+    }
 
     /// Flush buffered data.
     async fn flush(&mut self, signal: FlushSignal) -> FlushAck;

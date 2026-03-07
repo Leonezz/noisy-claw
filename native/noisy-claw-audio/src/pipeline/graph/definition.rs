@@ -55,6 +55,10 @@ pub enum DataStreamDescriptor {
         name: String,
         /// Sample rate in Hz.
         sample_rate: u32,
+        /// Node name that emits this stream (populated by builder).
+        #[serde(default, skip_deserializing)]
+        #[allow(clippy::default_constructed_unit_structs)]
+        node: Option<String>,
     },
     /// Structured metadata events streamed as JSON text frames.
     Metadata {
@@ -62,12 +66,29 @@ pub enum DataStreamDescriptor {
         name: String,
         /// Field descriptors for the structured data.
         fields: Vec<FieldDescriptor>,
+        /// Node name that emits this stream (populated by builder).
+        #[serde(default, skip_deserializing)]
+        node: Option<String>,
     },
     /// Text events (e.g., transcription results).
     Text {
         /// Stream name.
         name: String,
+        /// Node name that emits this stream (populated by builder).
+        #[serde(default, skip_deserializing)]
+        node: Option<String>,
     },
+}
+
+impl DataStreamDescriptor {
+    /// Set the node name on this descriptor.
+    pub fn with_node(self, node_name: &str) -> Self {
+        match self {
+            Self::Audio { name, sample_rate, .. } => Self::Audio { name, sample_rate, node: Some(node_name.to_string()) },
+            Self::Metadata { name, fields, .. } => Self::Metadata { name, fields, node: Some(node_name.to_string()) },
+            Self::Text { name, .. } => Self::Text { name, node: Some(node_name.to_string()) },
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -4,7 +4,7 @@ use std::collections::HashMap;
 /// Internal pipeline sample rate. All nodes process audio at this rate.
 pub const PIPELINE_SAMPLE_RATE: u32 = 48000;
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SttConfig {
     pub provider: String,
     pub api_key: Option<String>,
@@ -14,7 +14,7 @@ pub struct SttConfig {
     pub extra: Option<HashMap<String, String>>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TtsConfig {
     pub provider: String,
     pub api_key: Option<String>,

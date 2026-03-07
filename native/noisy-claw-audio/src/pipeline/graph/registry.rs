@@ -64,7 +64,7 @@ mod tests {
 
     #[test]
     fn registry_finds_all_pipeline_nodes() {
-        let expected = ["capture", "aec", "vad", "stt", "tts", "output", "topic", "ipc_sink"];
+        let expected = ["capture", "aec", "vad", "stt_local", "stt_cloud", "tts", "output", "topic"];
         for name in expected {
             assert!(
                 NodeRegistry::find(name).is_some(),

@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Sleep;
 
@@ -12,7 +12,7 @@ use crate::cloud::traits::{RecognizerConfig, SpeechRecognizer};
 use crate::protocol::{Event, SttConfig};
 use crate::stt::WhisperSTT;
 
-use super::{AudioFrame, VadEvent};
+use super::AudioFrame;
 
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -63,15 +63,16 @@ impl Handle {
 /// Spawn the STT node.
 ///
 /// Inputs:
-///   - `audio_rx`:  cleaned audio from VadNode (passthrough)
-///   - `vad_rx`:    VAD transitions from VadNode
+///   - `audio_rx`:           cleaned audio from VadNode (passthrough)
+///   - `user_speaking_rx`:   watch state from VadNode (user speaking status)
 ///
 /// Outputs:
 ///   - `event_tx`:  IPC events (Event::Transcript, Event::Error)
 pub fn spawn(
     mut audio_rx: mpsc::UnboundedReceiver<AudioFrame>,
-    mut vad_rx: mpsc::Receiver<VadEvent>,
+    mut user_speaking_rx: watch::Receiver<bool>,
     event_tx: mpsc::Sender<Event>,
+    stream_name: String,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
@@ -158,12 +159,13 @@ pub fn spawn(
                                     let samples = std::mem::take(&mut speech_buffer);
                                     let stt = stt.clone();
                                     let tx = event_tx.clone();
+                                    let sn = stream_name.clone();
                                     let base = compute_base_time(
                                         speech_start_time.take(),
                                         capture_start_time,
                                     );
                                     tokio::task::spawn_blocking(move || {
-                                        transcribe_and_emit(&stt, &samples, base, &tx);
+                                        transcribe_and_emit(&stt, &samples, base, &tx, &sn);
                                     });
                                 }
                             }
@@ -272,27 +274,29 @@ pub fn spawn(
                     }
                 }
 
-                // Process VAD events
-                Some(vad_event) = vad_rx.recv() => {
+                // Process user_speaking state changes
+                Ok(()) = user_speaking_rx.changed() => {
+                    let speaking = *user_speaking_rx.borrow();
                     let prev_speaking = was_speaking;
-                    was_speaking = vad_event.speaking;
+                    was_speaking = speaking;
 
-                    if vad_event.speaking && !prev_speaking {
+                    if speaking && !prev_speaking {
                         speech_start_time = Some(Instant::now());
                     }
 
-                    if !vad_event.speaking && prev_speaking && !using_cloud {
+                    if !speaking && prev_speaking && !using_cloud {
                         // End of speech — transcribe for local Whisper
                         if let Some(ref stt) = whisper_engine {
                             let samples = std::mem::take(&mut speech_buffer);
                             let stt = stt.clone();
                             let tx = event_tx.clone();
+                            let sn = stream_name.clone();
                             let base = compute_base_time(
                                 speech_start_time.take(),
                                 capture_start_time,
                             );
                             tokio::task::spawn_blocking(move || {
-                                transcribe_and_emit(&stt, &samples, base, &tx);
+                                transcribe_and_emit(&stt, &samples, base, &tx, &sn);
                             });
                         }
                     }
@@ -314,6 +318,11 @@ pub fn spawn(
                                 is_final = recognition.is_final,
                                 "STT node: transcript"
                             );
+                            super::dump::write_metadata(&stream_name, serde_json::json!({
+                                "text": &recognition.text,
+                                "is_final": recognition.is_final,
+                                "confidence": recognition.confidence,
+                            }));
                             let _ = event_tx.send(Event::Transcript {
                                 text: recognition.text,
                                 is_final: recognition.is_final,
@@ -389,16 +398,22 @@ fn transcribe_and_emit(
     samples: &[f32],
     base_time: f64,
     event_tx: &mpsc::Sender<Event>,
+    stream_name: &str,
 ) {
     match stt.transcribe(samples) {
         Ok(segments) => {
             for seg in segments {
+                super::dump::write_metadata(stream_name, serde_json::json!({
+                    "text": &seg.text,
+                    "is_final": true,
+                    "confidence": 1.0,
+                }));
                 let _ = event_tx.blocking_send(Event::Transcript {
                     text: seg.text,
-                    is_final: seg.is_final,
+                    is_final: true,
                     start: base_time + seg.start,
                     end: base_time + seg.end,
-                    confidence: None,
+                    confidence: Some(1.0),
                 });
             }
         }

@@ -1,7 +1,7 @@
 use anyhow::Result;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use crate::pipeline::{AudioFrame, OutputMessage, VadEvent};
+use crate::pipeline::{AudioFrame, OutputMessage};
 use crate::protocol::Event;
 
 use super::types::{PortSender, PortType};
@@ -9,20 +9,18 @@ use super::types::{PortSender, PortType};
 /// Typed input endpoints injected by the pipeline builder.
 pub enum InputEndpoint {
     Audio(mpsc::UnboundedReceiver<AudioFrame>),
-    VadEvent(mpsc::UnboundedReceiver<VadEvent>),
     OutputMsg(mpsc::UnboundedReceiver<OutputMessage>),
     IpcEvent(mpsc::UnboundedReceiver<Event>),
-    Signal(mpsc::UnboundedReceiver<()>),
+    State(watch::Receiver<bool>),
 }
 
 impl InputEndpoint {
     pub fn port_type(&self) -> PortType {
         match self {
             Self::Audio(_) => PortType::Audio,
-            Self::VadEvent(_) => PortType::VadEvent,
             Self::OutputMsg(_) => PortType::OutputMsg,
             Self::IpcEvent(_) => PortType::IpcEvent,
-            Self::Signal(_) => PortType::Signal,
+            Self::State(_) => PortType::State,
         }
     }
 }
@@ -30,20 +28,18 @@ impl InputEndpoint {
 /// Typed output endpoints injected by the pipeline builder.
 pub enum OutputEndpoint {
     Audio(PortSender<AudioFrame>),
-    VadEvent(PortSender<VadEvent>),
     OutputMsg(PortSender<OutputMessage>),
     IpcEvent(PortSender<Event>),
-    Signal(PortSender<()>),
+    State(watch::Sender<bool>),
 }
 
 impl OutputEndpoint {
     pub fn port_type(&self) -> PortType {
         match self {
             Self::Audio(_) => PortType::Audio,
-            Self::VadEvent(_) => PortType::VadEvent,
             Self::OutputMsg(_) => PortType::OutputMsg,
             Self::IpcEvent(_) => PortType::IpcEvent,
-            Self::Signal(_) => PortType::Signal,
+            Self::State(_) => PortType::State,
         }
     }
 }
@@ -57,7 +53,7 @@ pub trait NodeWiring: Send + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pipeline::{AudioFrame, VadEvent};
+    use crate::pipeline::AudioFrame;
 
     #[test]
     fn input_endpoint_audio_variant() {
@@ -81,9 +77,16 @@ mod tests {
     }
 
     #[test]
-    fn output_endpoint_port_type() {
-        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel::<VadEvent>();
-        let ep = OutputEndpoint::VadEvent(PortSender::Direct(tx));
-        assert_eq!(ep.port_type(), PortType::VadEvent);
+    fn output_endpoint_state_port_type() {
+        let (tx, _rx) = watch::channel(false);
+        let ep = OutputEndpoint::State(tx);
+        assert_eq!(ep.port_type(), PortType::State);
+    }
+
+    #[test]
+    fn input_endpoint_state_port_type() {
+        let (_tx, rx) = watch::channel(false);
+        let ep = InputEndpoint::State(rx);
+        assert_eq!(ep.port_type(), PortType::State);
     }
 }

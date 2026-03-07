@@ -14,14 +14,12 @@ use tokio::sync::mpsc;
 pub enum PortType {
     /// AudioFrame — unbounded channel, low-latency
     Audio,
-    /// VadEvent — bounded channel
-    VadEvent,
     /// OutputMessage — bounded channel
     OutputMsg,
     /// protocol::Event — bounded channel
     IpcEvent,
-    /// () — bounded signal (e.g., barge-in)
-    Signal,
+    /// bool — watch channel for observable state (e.g., speaker_active, user_speaking)
+    State,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +92,8 @@ pub struct NodeSnapshot {
     pub status: NodeStatus,
     pub properties: serde_json::Map<String, serde_json::Value>,
     pub metrics: HashMap<String, f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_error: Option<String>,
 }
 
 // ── Property Descriptors ────────────────────────────────────
@@ -155,7 +155,7 @@ mod tests {
     #[test]
     fn port_type_equality() {
         assert_eq!(PortType::Audio, PortType::Audio);
-        assert_ne!(PortType::Audio, PortType::VadEvent);
+        assert_ne!(PortType::Audio, PortType::State);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
-use crate::pipeline::{AudioFrame, OutputMessage, VadEvent};
+use crate::pipeline::{AudioFrame, OutputMessage};
 use crate::protocol::Event;
 
 use super::definition::{parse_port_ref, PipelineDefinition};
@@ -59,7 +59,9 @@ impl PipelineBuilder {
     }
 
     /// Wire all links and return the built pipeline nodes.
-    pub fn build(mut self) -> Result<BuiltPipeline> {
+    /// If `event_bus_tx` is provided, all `IpcEvent` output ports are automatically
+    /// fanned-out to this sender (the pipeline event bus).
+    pub fn build(mut self, event_bus_tx: Option<mpsc::UnboundedSender<Event>>) -> Result<BuiltPipeline> {
         // Collect port type info for validation
         let mut port_types: HashMap<PortKey, PortType> = HashMap::new();
         for (name, node) in &self.nodes {
@@ -75,6 +77,9 @@ impl PipelineBuilder {
         let mut input_channels: HashMap<PortKey, InputChannelState> = HashMap::new();
         let mut output_senders: HashMap<PortKey, Vec<OutputSenderEntry>> = HashMap::new();
 
+        // State (watch) channels — keyed by source port, support fan-out via subscribe()
+        let mut state_senders: HashMap<PortKey, watch::Sender<bool>> = HashMap::new();
+
         for link in &self.definition.links {
             let (src_node, src_port) = parse_port_ref(&link.from)?;
             let (dst_node, dst_port) = parse_port_ref(&link.to)?;
@@ -89,6 +94,21 @@ impl PipelineBuilder {
 
             Self::validate_port_types(*src_type, *dst_type)?;
 
+            // State ports use watch channels (separate path)
+            if *src_type == PortType::State {
+                let tx = state_senders
+                    .entry(src_key)
+                    .or_insert_with(|| {
+                        let (tx, _) = watch::channel(false);
+                        tx
+                    });
+                let rx = tx.subscribe();
+                let node = self.nodes.get_mut(dst_node)
+                    .ok_or_else(|| anyhow!("node not found: {dst_node}"))?;
+                node.accept_input(dst_port, InputEndpoint::State(rx))?;
+                continue;
+            }
+
             // Create or reuse channel based on port type
             let sender = match src_type {
                 PortType::Audio => {
@@ -96,12 +116,6 @@ impl PipelineBuilder {
                         .entry(dst_key)
                         .or_insert_with(|| InputChannelState::new_audio());
                     entry.clone_audio_tx()
-                }
-                PortType::VadEvent => {
-                    let entry = input_channels
-                        .entry(dst_key)
-                        .or_insert_with(|| InputChannelState::new_vad_event());
-                    entry.clone_vad_event_tx()
                 }
                 PortType::OutputMsg => {
                     let entry = input_channels
@@ -115,18 +129,27 @@ impl PipelineBuilder {
                         .or_insert_with(|| InputChannelState::new_ipc_event());
                     entry.clone_ipc_event_tx()
                 }
-                PortType::Signal => {
-                    let entry = input_channels
-                        .entry(dst_key)
-                        .or_insert_with(|| InputChannelState::new_signal());
-                    entry.clone_signal_tx()
-                }
+                PortType::State => unreachable!(), // handled above
             };
 
             output_senders
                 .entry(src_key)
                 .or_default()
                 .push(sender);
+        }
+
+        // Auto-wire all IpcEvent output ports to the pipeline event bus
+        if let Some(bus_tx) = event_bus_tx {
+            for (name, node) in &self.nodes {
+                for pd in node.ports() {
+                    if pd.port_type == PortType::IpcEvent && pd.direction == super::types::Direction::Out {
+                        output_senders
+                            .entry(PortKey::new(name, &pd.name))
+                            .or_default()
+                            .push(OutputSenderEntry::IpcEvent(bus_tx.clone()));
+                    }
+                }
+            }
         }
 
         // Inject input receivers into nodes
@@ -144,6 +167,21 @@ impl PipelineBuilder {
             let endpoint = build_output_endpoint(senders);
             node.set_output(&key.port, endpoint)?;
         }
+
+        // Inject state (watch) senders into source nodes
+        for (key, sender) in state_senders {
+            let node = self.nodes.get_mut(&key.node)
+                .ok_or_else(|| anyhow!("node not found: {}", key.node))?;
+            node.set_output(&key.port, OutputEndpoint::State(sender))?;
+        }
+
+        // Collect data stream descriptors from all nodes, tagging each with its node name
+        let data_streams: Vec<_> = self.nodes.iter()
+            .flat_map(|(name, node)| {
+                node.data_streams().into_iter().map(|ds| ds.with_node(name)).collect::<Vec<_>>()
+            })
+            .collect();
+        self.definition.data_streams = data_streams;
 
         Ok(BuiltPipeline {
             nodes: self.nodes,
@@ -164,10 +202,6 @@ enum InputChannelState {
         tx: mpsc::UnboundedSender<AudioFrame>,
         rx: Option<mpsc::UnboundedReceiver<AudioFrame>>,
     },
-    VadEvent {
-        tx: mpsc::UnboundedSender<VadEvent>,
-        rx: Option<mpsc::UnboundedReceiver<VadEvent>>,
-    },
     OutputMsg {
         tx: mpsc::UnboundedSender<OutputMessage>,
         rx: Option<mpsc::UnboundedReceiver<OutputMessage>>,
@@ -176,20 +210,12 @@ enum InputChannelState {
         tx: mpsc::UnboundedSender<Event>,
         rx: Option<mpsc::UnboundedReceiver<Event>>,
     },
-    Signal {
-        tx: mpsc::UnboundedSender<()>,
-        rx: Option<mpsc::UnboundedReceiver<()>>,
-    },
 }
 
 impl InputChannelState {
     fn new_audio() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         Self::Audio { tx, rx: Some(rx) }
-    }
-    fn new_vad_event() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Self::VadEvent { tx, rx: Some(rx) }
     }
     fn new_output_msg() -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -199,20 +225,10 @@ impl InputChannelState {
         let (tx, rx) = mpsc::unbounded_channel();
         Self::IpcEvent { tx, rx: Some(rx) }
     }
-    fn new_signal() -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-        Self::Signal { tx, rx: Some(rx) }
-    }
 
     fn clone_audio_tx(&self) -> OutputSenderEntry {
         match self {
             Self::Audio { tx, .. } => OutputSenderEntry::Audio(tx.clone()),
-            _ => panic!("type mismatch"),
-        }
-    }
-    fn clone_vad_event_tx(&self) -> OutputSenderEntry {
-        match self {
-            Self::VadEvent { tx, .. } => OutputSenderEntry::VadEvent(tx.clone()),
             _ => panic!("type mismatch"),
         }
     }
@@ -228,20 +244,11 @@ impl InputChannelState {
             _ => panic!("type mismatch"),
         }
     }
-    fn clone_signal_tx(&self) -> OutputSenderEntry {
-        match self {
-            Self::Signal { tx, .. } => OutputSenderEntry::Signal(tx.clone()),
-            _ => panic!("type mismatch"),
-        }
-    }
 
     fn take_input_endpoint(self) -> Result<InputEndpoint> {
         match self {
             Self::Audio { rx, .. } => Ok(InputEndpoint::Audio(
                 rx.ok_or_else(|| anyhow!("audio rx already taken"))?
-            )),
-            Self::VadEvent { rx, .. } => Ok(InputEndpoint::VadEvent(
-                rx.ok_or_else(|| anyhow!("vad_event rx already taken"))?
             )),
             Self::OutputMsg { rx, .. } => Ok(InputEndpoint::OutputMsg(
                 rx.ok_or_else(|| anyhow!("output_msg rx already taken"))?
@@ -249,19 +256,14 @@ impl InputChannelState {
             Self::IpcEvent { rx, .. } => Ok(InputEndpoint::IpcEvent(
                 rx.ok_or_else(|| anyhow!("ipc_event rx already taken"))?
             )),
-            Self::Signal { rx, .. } => Ok(InputEndpoint::Signal(
-                rx.ok_or_else(|| anyhow!("signal rx already taken"))?
-            )),
         }
     }
 }
 
 enum OutputSenderEntry {
     Audio(mpsc::UnboundedSender<AudioFrame>),
-    VadEvent(mpsc::UnboundedSender<VadEvent>),
     OutputMsg(mpsc::UnboundedSender<OutputMessage>),
     IpcEvent(mpsc::UnboundedSender<Event>),
-    Signal(mpsc::UnboundedSender<()>),
 }
 
 fn build_output_endpoint(senders: Vec<OutputSenderEntry>) -> OutputEndpoint {
@@ -269,10 +271,8 @@ fn build_output_endpoint(senders: Vec<OutputSenderEntry>) -> OutputEndpoint {
     if senders.len() == 1 {
         match senders.into_iter().next().unwrap() {
             OutputSenderEntry::Audio(tx) => OutputEndpoint::Audio(PortSender::Direct(tx)),
-            OutputSenderEntry::VadEvent(tx) => OutputEndpoint::VadEvent(PortSender::Direct(tx)),
             OutputSenderEntry::OutputMsg(tx) => OutputEndpoint::OutputMsg(PortSender::Direct(tx)),
             OutputSenderEntry::IpcEvent(tx) => OutputEndpoint::IpcEvent(PortSender::Direct(tx)),
-            OutputSenderEntry::Signal(tx) => OutputEndpoint::Signal(PortSender::Direct(tx)),
         }
     } else {
         // Fan-out: collect all senders of the same type
@@ -284,13 +284,6 @@ fn build_output_endpoint(senders: Vec<OutputSenderEntry>) -> OutputEndpoint {
                     _ => unreachable!(),
                 }).collect();
                 OutputEndpoint::Audio(PortSender::FanOut(txs))
-            }
-            OutputSenderEntry::VadEvent(_) => {
-                let txs: Vec<_> = senders.into_iter().map(|s| match s {
-                    OutputSenderEntry::VadEvent(tx) => tx,
-                    _ => unreachable!(),
-                }).collect();
-                OutputEndpoint::VadEvent(PortSender::FanOut(txs))
             }
             OutputSenderEntry::OutputMsg(_) => {
                 let txs: Vec<_> = senders.into_iter().map(|s| match s {
@@ -306,13 +299,6 @@ fn build_output_endpoint(senders: Vec<OutputSenderEntry>) -> OutputEndpoint {
                 }).collect();
                 OutputEndpoint::IpcEvent(PortSender::FanOut(txs))
             }
-            OutputSenderEntry::Signal(_) => {
-                let txs: Vec<_> = senders.into_iter().map(|s| match s {
-                    OutputSenderEntry::Signal(tx) => tx,
-                    _ => unreachable!(),
-                }).collect();
-                OutputEndpoint::Signal(PortSender::FanOut(txs))
-            }
         }
     }
 }
@@ -323,7 +309,7 @@ mod tests {
 
     #[test]
     fn validate_link_incompatible_types() {
-        let result = PipelineBuilder::validate_port_types(PortType::Audio, PortType::VadEvent);
+        let result = PipelineBuilder::validate_port_types(PortType::Audio, PortType::State);
         assert!(result.is_err());
     }
 

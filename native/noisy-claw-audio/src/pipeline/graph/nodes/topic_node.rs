@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::pipeline::graph::node::{NodeHandle, PipelineNode};
 use crate::pipeline::graph::registry::NodeFactoryEntry;
@@ -21,7 +21,10 @@ pub struct TopicNode {
     similarity_threshold: f32,
     max_block_secs: f64,
     silence_block_secs: f64,
+    enabled: bool,
+    transcript_event_in: Option<mpsc::UnboundedReceiver<Event>>,
     ipc_event_out: Option<OutputEndpoint>,
+    enabled_tx: Option<watch::Sender<bool>>,
     inner: Option<topic::Handle>,
     status: NodeStatus,
 }
@@ -39,18 +42,26 @@ impl TopicNode {
                 .unwrap_or(120.0),
             silence_block_secs: props.get("silence_block_secs").and_then(|v| v.as_f64())
                 .unwrap_or(30.0),
+            enabled: props.get("enabled").and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            transcript_event_in: None,
             ipc_event_out: None,
+            enabled_tx: None,
             inner: None,
             status: NodeStatus::Created,
         })
     }
-
-    pub fn inner(&self) -> Option<&topic::Handle> { self.inner.as_ref() }
 }
 
 impl NodeWiring for TopicNode {
-    fn accept_input(&mut self, port: &str, _ep: InputEndpoint) -> Result<()> {
-        Err(anyhow!("topic: no input port '{port}'"))
+    fn accept_input(&mut self, port: &str, ep: InputEndpoint) -> Result<()> {
+        match port {
+            "transcript_event_in" => match ep {
+                InputEndpoint::IpcEvent(rx) => { self.transcript_event_in = Some(rx); Ok(()) }
+                _ => Err(anyhow!("transcript_event_in expects IpcEvent")),
+            },
+            _ => Err(anyhow!("topic: unknown input '{port}'")),
+        }
     }
 
     fn set_output(&mut self, port: &str, ep: OutputEndpoint) -> Result<()> {
@@ -99,6 +110,12 @@ impl PipelineNode for TopicNode {
                 default: serde_json::json!(30.0),
                 description: "Silence seconds before forced topic emit",
             },
+            PropertyDescriptor {
+                name: Cow::Borrowed("enabled"),
+                value_type: PropType::Bool,
+                default: serde_json::json!(false),
+                description: "Enable topic detection (activates model loading)",
+            },
         ]
     }
 
@@ -112,6 +129,14 @@ impl PipelineNode for TopicNode {
         }
         if let Some(v) = props.get("silence_block_secs") {
             if let Some(t) = v.as_f64() { self.silence_block_secs = t; reconfigure = true; }
+        }
+        if let Some(v) = props.get("enabled") {
+            if let Some(e) = v.as_bool() {
+                self.enabled = e;
+                if let Some(ref tx) = self.enabled_tx {
+                    tx.send(e).ok();
+                }
+            }
         }
         if reconfigure {
             if let Some(ref h) = self.inner {
@@ -132,24 +157,30 @@ impl PipelineNode for TopicNode {
         p.insert("similarity_threshold".into(), serde_json::json!(self.similarity_threshold));
         p.insert("max_block_secs".into(), serde_json::json!(self.max_block_secs));
         p.insert("silence_block_secs".into(), serde_json::json!(self.silence_block_secs));
+        p.insert("enabled".into(), serde_json::json!(self.enabled));
         NodeSnapshot {
             node_type: "topic".to_string(),
             status: self.status.clone(),
             properties: p,
             metrics: HashMap::new(),
+            last_error: None,
         }
     }
 
     async fn start(&mut self) -> Result<NodeHandle> {
         // IpcEvent output: bounded → PortSender bridge
-        let ipc_out = match self.ipc_event_out.take() {
-            Some(OutputEndpoint::IpcEvent(s)) => s,
-            _ => return Err(anyhow!("ipc_event_out not wired")),
-        };
         let (evt_tx, mut evt_rx) = mpsc::channel::<Event>(64);
-        tokio::spawn(async move {
-            while let Some(ev) = evt_rx.recv().await { ipc_out.send(ev); }
-        });
+        if let Some(OutputEndpoint::IpcEvent(ipc_out)) = self.ipc_event_out.take() {
+            tokio::spawn(async move {
+                while let Some(ev) = evt_rx.recv().await { ipc_out.send(ev); }
+            });
+        } else {
+            tokio::spawn(async move { while evt_rx.recv().await.is_some() {} });
+        }
+
+        // Enabled watch channel
+        let (enabled_tx, enabled_rx) = watch::channel(self.enabled);
+        self.enabled_tx = Some(enabled_tx);
 
         let handle = topic::spawn(
             evt_tx,
@@ -158,7 +189,20 @@ impl PipelineNode for TopicNode {
             self.similarity_threshold,
             self.max_block_secs,
             self.silence_block_secs,
+            enabled_rx,
         );
+
+        // Bridge: filter IpcEvent for final transcripts → topic control channel
+        if let Some(mut rx) = self.transcript_event_in.take() {
+            let ctl_tx = handle.control_tx.clone();
+            tokio::spawn(async move {
+                while let Some(event) = rx.recv().await {
+                    if let Event::Transcript { text, is_final: true, .. } = event {
+                        let _ = ctl_tx.send(topic::Control::Transcript { text }).await;
+                    }
+                }
+            });
+        }
 
         self.inner = Some(handle);
         self.status = NodeStatus::Running;
@@ -181,6 +225,7 @@ impl PipelineNode for TopicNode {
 
 fn topic_ports() -> Vec<PortDescriptor> {
     vec![
+        PortDescriptor { name: Cow::Borrowed("transcript_event_in"), port_type: PortType::IpcEvent, direction: Direction::In },
         PortDescriptor { name: Cow::Borrowed("ipc_event_out"), port_type: PortType::IpcEvent, direction: Direction::Out },
     ]
 }

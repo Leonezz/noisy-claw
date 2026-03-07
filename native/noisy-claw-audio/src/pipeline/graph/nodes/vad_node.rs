@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{anyhow, Result};
 use tokio::sync::{mpsc, watch};
 
+use crate::pipeline::graph::definition::{DataStreamDescriptor, FieldDescriptor};
 use crate::pipeline::graph::node::{NodeHandle, PipelineNode};
 use crate::pipeline::graph::registry::NodeFactoryEntry;
 use crate::pipeline::graph::types::{
@@ -12,53 +13,49 @@ use crate::pipeline::graph::types::{
     PropType, PropertyDescriptor, PropertyMap,
 };
 use crate::pipeline::graph::wiring::{InputEndpoint, NodeWiring, OutputEndpoint};
-use crate::pipeline::{vad, AudioFrame, FlushAck, FlushSignal, NodeId, VadEvent};
+use crate::expand_tilde;
+use crate::pipeline::{vad, AudioFrame, FlushAck, FlushSignal, NodeId};
 use crate::protocol::Event;
 
 pub struct VadNode {
     model_path: String,
     threshold: f32,
-    speaking_tts_tx: watch::Sender<bool>,
     audio_in: Option<mpsc::UnboundedReceiver<AudioFrame>>,
+    speaker_state_in: Option<watch::Receiver<bool>>,
     audio_out: Option<OutputEndpoint>,
-    vad_event_out: Option<OutputEndpoint>,
+    user_speaking_tx: Option<watch::Sender<bool>>,
     ipc_event_out: Option<OutputEndpoint>,
-    barge_in_out: Option<OutputEndpoint>,
-    /// Internal barge-in receiver exposed to the orchestrator (when not graph-wired).
-    internal_barge_in_rx: Option<mpsc::Receiver<()>>,
+    /// Subscribed during start() for the orchestrator to observe user_speaking state.
+    user_speaking_rx: Option<watch::Receiver<bool>>,
     inner: Option<vad::Handle>,
     status: NodeStatus,
+    last_error: Option<String>,
 }
 
 impl VadNode {
     pub fn new(props: &serde_json::Value) -> Result<Self> {
-        let (speaking_tts_tx, _) = watch::channel(false);
         Ok(Self {
             model_path: props.get("model_path").and_then(|v| v.as_str())
                 .unwrap_or("").to_string(),
             threshold: props.get("threshold").and_then(|v| v.as_f64())
                 .unwrap_or(0.5) as f32,
-            speaking_tts_tx,
             audio_in: None,
+            speaker_state_in: None,
             audio_out: None,
-            vad_event_out: None,
+            user_speaking_tx: None,
             ipc_event_out: None,
-            barge_in_out: None,
-            internal_barge_in_rx: None,
+            user_speaking_rx: None,
             inner: None,
             status: NodeStatus::Created,
+            last_error: None,
         })
     }
 
     pub fn inner(&self) -> Option<&vad::Handle> { self.inner.as_ref() }
 
-    /// Access the TTS speaking state sender for external control.
-    pub fn speaking_tts_tx(&self) -> &watch::Sender<bool> { &self.speaking_tts_tx }
-
-    /// Take the barge-in receiver. Call after start().
-    /// Returns None if barge_in_out was wired through the graph instead.
-    pub fn take_barge_in_rx(&mut self) -> Option<mpsc::Receiver<()>> {
-        self.internal_barge_in_rx.take()
+    /// Take the user_speaking watch receiver. Call after start().
+    pub fn take_user_speaking_rx(&mut self) -> Option<watch::Receiver<bool>> {
+        self.user_speaking_rx.take()
     }
 }
 
@@ -69,6 +66,10 @@ impl NodeWiring for VadNode {
                 InputEndpoint::Audio(rx) => { self.audio_in = Some(rx); Ok(()) }
                 _ => Err(anyhow!("audio_in expects Audio")),
             },
+            "speaker_state_in" => match ep {
+                InputEndpoint::State(rx) => { self.speaker_state_in = Some(rx); Ok(()) }
+                _ => Err(anyhow!("speaker_state_in expects State")),
+            },
             _ => Err(anyhow!("vad: unknown input '{port}'")),
         }
     }
@@ -76,9 +77,11 @@ impl NodeWiring for VadNode {
     fn set_output(&mut self, port: &str, ep: OutputEndpoint) -> Result<()> {
         match port {
             "audio_out" => { self.audio_out = Some(ep); Ok(()) }
-            "vad_event_out" => { self.vad_event_out = Some(ep); Ok(()) }
+            "user_speaking_out" => match ep {
+                OutputEndpoint::State(tx) => { self.user_speaking_tx = Some(tx); Ok(()) }
+                _ => Err(anyhow!("user_speaking_out expects State")),
+            },
             "ipc_event_out" => { self.ipc_event_out = Some(ep); Ok(()) }
-            "barge_in_out" => { self.barge_in_out = Some(ep); Ok(()) }
             _ => Err(anyhow!("vad: unknown output '{port}'")),
         }
     }
@@ -87,6 +90,23 @@ impl NodeWiring for VadNode {
 #[async_trait::async_trait]
 impl PipelineNode for VadNode {
     fn node_type(&self) -> &'static str { "vad" }
+
+    fn data_streams(&self) -> Vec<DataStreamDescriptor> {
+        vec![
+            DataStreamDescriptor::Audio { name: "vad_pass".into(), sample_rate: 48000, node: None },
+            DataStreamDescriptor::Metadata {
+                name: "vad".into(),
+                fields: vec![
+                    FieldDescriptor { name: "speech_prob".into(), field_type: "f64".into() },
+                    FieldDescriptor { name: "is_speech".into(), field_type: "bool".into() },
+                    FieldDescriptor { name: "speaker_active".into(), field_type: "bool".into() },
+                    FieldDescriptor { name: "blanking".into(), field_type: "u32".into() },
+                    FieldDescriptor { name: "was_speaking".into(), field_type: "bool".into() },
+                ],
+                node: None,
+            },
+        ]
+    }
 
     fn ports(&self) -> Vec<PortDescriptor> { vad_ports() }
 
@@ -102,23 +122,35 @@ impl PipelineNode for VadNode {
                 name: Cow::Borrowed("threshold"),
                 value_type: PropType::Float { min: 0.0, max: 1.0 },
                 default: serde_json::json!(0.5),
-                description: "Speech detection threshold",
+                description: "Speech detection threshold (base)",
             },
         ]
     }
 
+    async fn command(&mut self, cmd: &str, _args: serde_json::Value) -> Result<serde_json::Value> {
+        match cmd {
+            "status" => {
+                let initialized = self.inner().map_or(false, |h| h.is_initialized());
+                Ok(serde_json::json!({ "initialized": initialized }))
+            }
+            "reset" => {
+                if let Some(h) = self.inner() { h.reset().await; }
+                Ok(serde_json::json!({}))
+            }
+            _ => Err(anyhow!("vad: unknown command: {cmd}")),
+        }
+    }
+
     fn update(&mut self, props: &PropertyMap) -> Result<()> {
+        if let Some(v) = props.get("model_path") {
+            if let Some(p) = v.as_str() { self.model_path = p.to_string(); }
+        }
         if let Some(v) = props.get("threshold") {
             if let Some(t) = v.as_f64() {
                 self.threshold = t as f32;
                 if let Some(ref h) = self.inner {
                     let _ = h.control_tx.try_send(vad::Control::SetThreshold(self.threshold));
                 }
-            }
-        }
-        if let Some(v) = props.get("speaking_tts") {
-            if let Some(b) = v.as_bool() {
-                let _ = self.speaking_tts_tx.send(b);
             }
         }
         Ok(())
@@ -128,12 +160,12 @@ impl PipelineNode for VadNode {
         let mut p = serde_json::Map::new();
         p.insert("model_path".into(), serde_json::json!(self.model_path));
         p.insert("threshold".into(), serde_json::json!(self.threshold));
-        p.insert("speaking_tts".into(), serde_json::json!(*self.speaking_tts_tx.borrow()));
         NodeSnapshot {
             node_type: "vad".to_string(),
             status: self.status.clone(),
             properties: p,
             metrics: HashMap::new(),
+            last_error: self.last_error.clone(),
         }
     }
 
@@ -145,59 +177,55 @@ impl PipelineNode for VadNode {
             Some(OutputEndpoint::Audio(s)) => s,
             _ => return Err(anyhow!("audio_out not wired")),
         };
-        let vad_event_out = match self.vad_event_out.take() {
-            Some(OutputEndpoint::VadEvent(s)) => s,
-            _ => return Err(anyhow!("vad_event_out not wired")),
-        };
-        let ipc_event_out = match self.ipc_event_out.take() {
-            Some(OutputEndpoint::IpcEvent(s)) => s,
-            _ => return Err(anyhow!("ipc_event_out not wired")),
-        };
         // Audio output: unbounded bridge
         let (audio_tx, mut audio_bridge_rx) = mpsc::unbounded_channel::<AudioFrame>();
         tokio::spawn(async move {
             while let Some(f) = audio_bridge_rx.recv().await { audio_out.send(f); }
         });
 
-        // VadEvent output: bounded → PortSender bridge
-        let (vad_ev_tx, mut vad_ev_rx) = mpsc::channel::<VadEvent>(64);
-        tokio::spawn(async move {
-            while let Some(ev) = vad_ev_rx.recv().await { vad_event_out.send(ev); }
-        });
-
-        // IpcEvent output: bounded → PortSender bridge
+        // IpcEvent output: optional (not needed in standalone mode)
         let (evt_tx, mut evt_rx) = mpsc::channel::<Event>(64);
-        tokio::spawn(async move {
-            while let Some(ev) = evt_rx.recv().await { ipc_event_out.send(ev); }
-        });
-
-        // Signal output: graph-wired bridge OR internal channel for orchestrator
-        let sig_tx = if let Some(OutputEndpoint::Signal(barge_in_out)) = self.barge_in_out.take() {
-            let (sig_tx, mut sig_rx) = mpsc::channel::<()>(16);
+        if let Some(OutputEndpoint::IpcEvent(ipc_event_out)) = self.ipc_event_out.take() {
             tokio::spawn(async move {
-                while sig_rx.recv().await.is_some() { barge_in_out.send(()); }
+                while let Some(ev) = evt_rx.recv().await { ipc_event_out.send(ev); }
             });
-            sig_tx
         } else {
-            let (sig_tx, sig_rx) = mpsc::channel::<()>(16);
-            self.internal_barge_in_rx = Some(sig_rx);
-            sig_tx
-        };
+            // Drop events when ipc_event_out is not wired
+            tokio::spawn(async move { while evt_rx.recv().await.is_some() {} });
+        }
 
-        let speaking_tts_rx = self.speaking_tts_tx.subscribe();
+        // user_speaking State output
+        let user_speaking_tx = self.user_speaking_tx.take()
+            .ok_or_else(|| anyhow!("user_speaking_out not wired"))?;
+        // Subscribe for orchestrator before passing sender to inner task
+        self.user_speaking_rx = Some(user_speaking_tx.subscribe());
+
+        // speaker_state State input (from output node, optional — defaults to false)
+        let speaker_active_rx = self.speaker_state_in.take()
+            .unwrap_or_else(|| {
+                let (_tx, rx) = watch::channel(false);
+                rx
+            });
+
         let handle = vad::spawn(
             audio_rx,
             audio_tx,
-            vad_ev_tx,
+            user_speaking_tx,
             evt_tx,
-            sig_tx,
-            speaking_tts_rx,
-            PathBuf::from(&self.model_path),
+            speaker_active_rx,
+            expand_tilde(&self.model_path),
             self.threshold,
         );
 
+        if handle.is_initialized() {
+            self.status = NodeStatus::Running;
+            self.last_error = None;
+        } else {
+            let msg = format!("VAD model not found: {}", self.model_path);
+            self.status = NodeStatus::Error { message: msg.clone() };
+            self.last_error = Some(msg);
+        }
         self.inner = Some(handle);
-        self.status = NodeStatus::Running;
         let (stx, _) = mpsc::channel(1);
         Ok(NodeHandle::new(stx))
     }
@@ -218,10 +246,10 @@ impl PipelineNode for VadNode {
 fn vad_ports() -> Vec<PortDescriptor> {
     vec![
         PortDescriptor { name: Cow::Borrowed("audio_in"), port_type: PortType::Audio, direction: Direction::In },
+        PortDescriptor { name: Cow::Borrowed("speaker_state_in"), port_type: PortType::State, direction: Direction::In },
         PortDescriptor { name: Cow::Borrowed("audio_out"), port_type: PortType::Audio, direction: Direction::Out },
-        PortDescriptor { name: Cow::Borrowed("vad_event_out"), port_type: PortType::VadEvent, direction: Direction::Out },
+        PortDescriptor { name: Cow::Borrowed("user_speaking_out"), port_type: PortType::State, direction: Direction::Out },
         PortDescriptor { name: Cow::Borrowed("ipc_event_out"), port_type: PortType::IpcEvent, direction: Direction::Out },
-        PortDescriptor { name: Cow::Borrowed("barge_in_out"), port_type: PortType::Signal, direction: Direction::Out },
     ]
 }
 

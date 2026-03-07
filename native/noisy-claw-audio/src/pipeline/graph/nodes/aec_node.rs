@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
+use crate::pipeline::graph::definition::DataStreamDescriptor;
 use crate::pipeline::graph::node::{NodeHandle, PipelineNode};
 use crate::pipeline::graph::registry::NodeFactoryEntry;
 use crate::pipeline::graph::types::{
@@ -62,6 +63,14 @@ impl NodeWiring for AecNode {
 impl PipelineNode for AecNode {
     fn node_type(&self) -> &'static str { "aec" }
 
+    fn data_streams(&self) -> Vec<DataStreamDescriptor> {
+        vec![
+            DataStreamDescriptor::Audio { name: "capture".into(), sample_rate: 48000, node: None },
+            DataStreamDescriptor::Audio { name: "render".into(), sample_rate: 48000, node: None },
+            DataStreamDescriptor::Audio { name: "aec_out".into(), sample_rate: 48000, node: None },
+        ]
+    }
+
     fn ports(&self) -> Vec<PortDescriptor> { aec_ports() }
     fn property_descriptors(&self) -> Vec<PropertyDescriptor> { vec![] }
     fn update(&mut self, _props: &PropertyMap) -> Result<()> { Ok(()) }
@@ -72,6 +81,7 @@ impl PipelineNode for AecNode {
             status: self.status.clone(),
             properties: serde_json::Map::new(),
             metrics: HashMap::new(),
+            last_error: None,
         }
     }
 

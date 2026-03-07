@@ -68,22 +68,12 @@ pub struct VadState {
     pub speech_prob: f32,
     /// Whether any VAD window in this frame detected speech.
     pub is_speech: bool,
-    /// Whether TTS was playing when this frame was processed.
-    pub speaking_tts: bool,
+    /// Whether the speaker was active (outputting audio) when this frame was processed.
+    pub speaker_active: bool,
 }
 
-/// VAD state transition emitted by the VAD node.
-#[derive(Clone)]
-pub struct VadEvent {
-    pub speaking: bool,
-}
 
-/// Messages from the output node back to the orchestrator.
-pub enum OutputNodeEvent {
-    SpeakDone,
-}
-
-/// Messages sent to the output node (from TTS node and orchestrator).
+/// Messages sent to the output node (from TTS node).
 #[derive(Clone)]
 pub enum OutputMessage {
     /// Begin a new playback session at the given sample rate.

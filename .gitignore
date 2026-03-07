@@ -13,5 +13,9 @@ node_modules/
 # Audio dump data
 native/noisy-claw-audio/dump/
 
+# Visualizer build output
+native/noisy-claw-audio/visualizer/dist/
+*.tsbuildinfo
+
 # OS
 .DS_Store

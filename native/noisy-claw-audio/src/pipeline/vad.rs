@@ -9,15 +9,15 @@ use crate::audio_utils::Resampler;
 use crate::protocol::Event;
 use crate::vad::{VadWindowResult, VoiceActivityDetector};
 
-use super::{AudioFrame, VadEvent, VadState};
+use super::{AudioFrame, VadState};
 use super::dump;
 
 /// ~128ms at 32ms/window — number of consecutive VAD-positive frames
-/// required before confirming barge-in during TTS playback.
+/// required before confirming barge-in during speaker playback.
 const BARGE_IN_FRAME_COUNT: u32 = 4;
 
 /// ~192ms at 32ms/window — number of consecutive VAD-negative frames
-/// required before ending speech tracking during TTS. Prevents brief
+/// required before ending speech tracking during playback. Prevents brief
 /// probability dips from prematurely cutting off audio to STT.
 const SPEECH_END_FRAME_COUNT: u32 = 6;
 
@@ -27,7 +27,7 @@ const SPEECH_END_FRAME_COUNT: u32 = 6;
 const POST_FLUSH_BLANKING_FRAMES: u32 = 6;
 
 /// Comfort blanking: suppress barge-in detection for this many VAD windows
-/// after TTS starts, giving AEC time to converge (~192ms at 32ms/window).
+/// after speaker starts, giving AEC time to converge (~192ms at 32ms/window).
 const COMFORT_BLANKING_FRAMES: u32 = 6;
 
 /// AEC warmup: suppress barge-in detection for the first 3 seconds after
@@ -38,12 +38,6 @@ const AEC_WARMUP_DURATION: Duration = Duration::from_secs(3);
 pub enum Control {
     SetThreshold(f32),
     Reset,
-    /// Cancel a pending barge-in (false alarm). Resets gating state so audio
-    /// stops flowing to STT during TTS, and emits speaking:false events.
-    CancelBargeIn,
-    /// Apply post-flush blanking: suppress barge-in detection briefly while
-    /// residual speaker audio dies out and AEC stabilizes.
-    PostFlushBlanking,
     Shutdown,
 }
 
@@ -62,14 +56,6 @@ impl Handle {
         let _ = self.control_tx.send(Control::Reset).await;
     }
 
-    pub async fn cancel_barge_in(&self) {
-        let _ = self.control_tx.send(Control::CancelBargeIn).await;
-    }
-
-    pub async fn post_flush_blanking(&self) {
-        let _ = self.control_tx.send(Control::PostFlushBlanking).await;
-    }
-
     pub async fn shutdown(self) {
         let _ = self.control_tx.send(Control::Shutdown).await;
         let _ = self.join.await;
@@ -81,26 +67,26 @@ impl Handle {
     }
 }
 
+/// Barge-in threshold: raised automatically when speaker is active
+/// to reduce false triggers from AEC residual.
+const BARGE_IN_THRESHOLD: f32 = 0.85;
+
 /// Spawn the VAD node.
 ///
 /// Inputs:
-///   - `audio_rx`: cleaned audio from AecNode
+///   - `audio_rx`:           cleaned audio from AecNode
+///   - `is_speaker_active`:  watch state from OutputNode
 ///
 /// Outputs:
 ///   - `audio_passthrough_tx`: forwards audio to SttNode
-///   - `vad_event_tx`:         VAD transitions to SttNode
+///   - `user_speaking_tx`:     watch state → STT and orchestrator
 ///   - `event_tx`:             IPC events (Event::Vad) to stdout
-///   - `barge_in_tx`:          fires when barge-in is confirmed during TTS
-///
-/// Observes:
-///   - `is_speaking_tts`: pipeline-wide TTS state for hybrid gate
 pub fn spawn(
     mut audio_rx: mpsc::UnboundedReceiver<AudioFrame>,
     audio_passthrough_tx: mpsc::UnboundedSender<AudioFrame>,
-    vad_event_tx: mpsc::Sender<VadEvent>,
+    user_speaking_tx: watch::Sender<bool>,
     event_tx: mpsc::Sender<Event>,
-    barge_in_tx: mpsc::Sender<()>,
-    is_speaking_tts: watch::Receiver<bool>,
+    is_speaker_active: watch::Receiver<bool>,
     model_path: PathBuf,
     initial_threshold: f32,
 ) -> Handle {
@@ -135,14 +121,18 @@ pub fn spawn(
         let mut consecutive_silence_frames: u32 = 0;
         let mut was_speaking = false;
         let mut log_counter: u32 = 0;
-        let mut prev_speaking_tts = false;
+        let mut prev_speaker_active = false;
+
+        // Base threshold set by the user/mode; effective threshold is raised
+        // during playback to suppress AEC residual false triggers.
+        let mut base_threshold = initial_threshold;
 
         // AEC warmup: track when first audio arrives to suppress
         // barge-in during the initial convergence period.
         let mut first_audio_time: Option<Instant> = None;
 
         // Comfort blanking: countdown of VAD windows to suppress barge-in
-        // after TTS starts, giving AEC time to converge on the new signal.
+        // after speaker starts/stops, giving AEC time to converge.
         let mut blanking_countdown: u32 = 0;
 
         // Temporary buffer for VAD results (avoids double-borrow of vad)
@@ -153,9 +143,15 @@ pub fn spawn(
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
                         Control::SetThreshold(t) => {
+                            base_threshold = t;
                             if let Some(ref mut v) = vad {
-                                v.set_threshold(t);
-                                tracing::info!(threshold = t, "VAD node: threshold updated");
+                                let effective = if *is_speaker_active.borrow() {
+                                    t.max(BARGE_IN_THRESHOLD)
+                                } else {
+                                    t
+                                };
+                                v.set_threshold(effective);
+                                tracing::info!(base = t, effective, "VAD node: threshold updated");
                             }
                         }
                         Control::Reset => {
@@ -168,25 +164,6 @@ pub fn spawn(
                             was_speaking = false;
                             blanking_countdown = 0;
                             tracing::info!("VAD node: reset");
-                        }
-                        Control::CancelBargeIn => {
-                            // False alarm recovery: re-enable audio gating
-                            consecutive_speech_frames = 0;
-                            consecutive_silence_frames = 0;
-                            if was_speaking {
-                                was_speaking = false;
-                                let _ = event_tx.send(Event::Vad { speaking: false }).await;
-                                let _ = vad_event_tx.send(VadEvent { speaking: false }).await;
-                            }
-                            tracing::info!("VAD node: barge-in cancelled (false alarm)");
-                        }
-                        Control::PostFlushBlanking => {
-                            blanking_countdown = POST_FLUSH_BLANKING_FRAMES;
-                            consecutive_speech_frames = 0;
-                            tracing::info!(
-                                blanking_frames = POST_FLUSH_BLANKING_FRAMES,
-                                "VAD node: post-flush blanking active"
-                            );
                         }
                         Control::Shutdown => {
                             tracing::info!("VAD node: shutdown");
@@ -202,18 +179,41 @@ pub fn spawn(
                         tracing::info!("VAD node: first audio frame, AEC warmup started");
                     }
 
-                    let speaking_tts = *is_speaking_tts.borrow();
+                    let speaker_active = *is_speaker_active.borrow();
 
-                    // Detect TTS start transition → begin comfort blanking
-                    if speaking_tts && !prev_speaking_tts {
+                    // Detect speaker START transition → comfort blanking + raise threshold
+                    if speaker_active && !prev_speaker_active {
                         blanking_countdown = COMFORT_BLANKING_FRAMES;
                         consecutive_speech_frames = 0;
+                        if let Some(ref mut v) = vad {
+                            v.set_threshold(base_threshold.max(BARGE_IN_THRESHOLD));
+                        }
                         tracing::info!(
                             blanking_frames = COMFORT_BLANKING_FRAMES,
-                            "VAD node: TTS started, comfort blanking active"
+                            "VAD node: speaker started, comfort blanking + threshold raised"
                         );
                     }
-                    prev_speaking_tts = speaking_tts;
+
+                    // Detect speaker STOP transition → post-flush blanking + reset + restore threshold
+                    if !speaker_active && prev_speaker_active {
+                        blanking_countdown = POST_FLUSH_BLANKING_FRAMES;
+                        consecutive_speech_frames = 0;
+                        consecutive_silence_frames = 0;
+                        if was_speaking {
+                            was_speaking = false;
+                            let _ = user_speaking_tx.send(false);
+                            let _ = event_tx.send(Event::Vad { speaking: false }).await;
+                        }
+                        if let Some(ref mut v) = vad {
+                            v.reset();
+                            v.set_threshold(base_threshold);
+                        }
+                        tracing::info!(
+                            blanking_frames = POST_FLUSH_BLANKING_FRAMES,
+                            "VAD node: speaker stopped, post-flush blanking + threshold restored"
+                        );
+                    }
+                    prev_speaker_active = speaker_active;
 
                     // Downsample 48kHz→16kHz for VAD inference (Silero expects 16kHz)
                     let vad_samples = vad_resampler.process(&frame.samples);
@@ -228,8 +228,6 @@ pub fn spawn(
                                     max_prob = max_prob.max(w.speech_prob);
                                     any_speech = any_speech || w.is_speech;
                                 }
-                                // Process barge-in / transition logic below
-                                // (results are consumed in the for loop after forwarding)
                                 vad_results_buf.clear();
                                 vad_results_buf.extend(results);
                                 (max_prob, any_speech)
@@ -253,7 +251,7 @@ pub fn spawn(
                         vad: Some(VadState {
                             speech_prob: max_speech_prob,
                             is_speech: any_is_speech,
-                            speaking_tts,
+                            speaker_active,
                         }),
                     });
 
@@ -265,22 +263,21 @@ pub fn spawn(
                             "elapsed_ms": first_audio_time.map(|t| t.elapsed().as_secs_f64() * 1000.0).unwrap_or(0.0),
                             "speech_prob": w.speech_prob,
                             "is_speech": w.is_speech,
-                            "speaking_tts": speaking_tts,
+                            "speaker_active": speaker_active,
                             "blanking": blanking_countdown,
                             "was_speaking": was_speaking,
                         }));
 
                         // Blanking: suppress VAD events during comfort blanking
-                        // (TTS start) or post-flush settling. Must run in ALL
-                        // modes because speaking_tts is already false when
-                        // post-flush blanking fires.
+                        // (speaker start/stop). Must run in ALL modes because
+                        // speaker_active is already false when post-flush blanking fires.
                         if blanking_countdown > 0 {
                             blanking_countdown -= 1;
                             consecutive_speech_frames = 0;
                             continue;
                         }
 
-                        if speaking_tts {
+                        if speaker_active {
                             log_counter += 1;
 
                             if log_counter % 15 == 0 {
@@ -289,7 +286,7 @@ pub fn spawn(
                                     is_speech = w.is_speech,
                                     consecutive = consecutive_speech_frames,
                                     threshold = vad.as_ref().map(|v| v.threshold()).unwrap_or(0.0),
-                                    "VAD node: TTS gate"
+                                    "VAD node: speaker gate"
                                 );
                             }
 
@@ -310,7 +307,7 @@ pub fn spawn(
                                 if consecutive_speech_frames == 1 {
                                     tracing::info!(
                                         prob = format!("{:.3}", w.speech_prob),
-                                        "VAD node: speech frame detected during TTS"
+                                        "VAD node: speech frame detected during playback"
                                     );
                                 }
                                 if consecutive_speech_frames >= BARGE_IN_FRAME_COUNT
@@ -322,11 +319,8 @@ pub fn spawn(
                                         "VAD node: barge-in confirmed"
                                     );
 
-                                    let _ = barge_in_tx.send(()).await;
+                                    let _ = user_speaking_tx.send(true);
                                     let _ = event_tx.send(Event::Vad { speaking: true }).await;
-                                    let _ = vad_event_tx
-                                        .send(VadEvent { speaking: true })
-                                        .await;
                                     was_speaking = true;
                                 }
                             } else {
@@ -340,13 +334,11 @@ pub fn spawn(
                                         tracing::info!(
                                             consecutive_silence_frames,
                                             prob = format!("{:.3}", w.speech_prob),
-                                            "VAD node: speech ended during TTS (debounced)"
+                                            "VAD node: speech ended during playback (debounced)"
                                         );
+                                        let _ = user_speaking_tx.send(false);
                                         let _ =
                                             event_tx.send(Event::Vad { speaking: false }).await;
-                                        let _ = vad_event_tx
-                                            .send(VadEvent { speaking: false })
-                                            .await;
                                         was_speaking = false;
                                         consecutive_silence_frames = 0;
                                     }
@@ -354,7 +346,7 @@ pub fn spawn(
                                     tracing::info!(
                                         consecutive_speech_frames,
                                         prob = format!("{:.3}", w.speech_prob),
-                                        "VAD node: speech streak broken during TTS"
+                                        "VAD node: speech streak broken during playback"
                                     );
                                 }
                             }
@@ -367,8 +359,8 @@ pub fn spawn(
                                     prob = format!("{:.3}", w.speech_prob),
                                     "VAD node: transition"
                                 );
+                                let _ = user_speaking_tx.send(speaking);
                                 let _ = event_tx.send(Event::Vad { speaking }).await;
-                                let _ = vad_event_tx.send(VadEvent { speaking }).await;
                                 was_speaking = speaking;
                             }
                         }

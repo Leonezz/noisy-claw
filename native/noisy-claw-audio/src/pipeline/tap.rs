@@ -160,6 +160,37 @@ async fn handle_connection(
                                 let resp = set_mode(&pipeline_tx, mode).await;
                                 let _ = ws_tx.send(Message::Text(resp.into())).await;
                             }
+
+                            // ── Node type registry ───────────────────────────
+                            if val.get("get_node_types").is_some() {
+                                let resp = get_node_types(&pipeline_tx).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
+                            }
+
+                            // ── Pipeline lifecycle (standalone mode) ─────────
+                            if let Some(def) = val.get("load_pipeline") {
+                                let resp = load_pipeline(&pipeline_tx, def).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
+                            }
+
+                            if let Some(cap) = val.get("start_capture") {
+                                let device = cap.as_str()
+                                    .or_else(|| cap.get("device").and_then(|d| d.as_str()))
+                                    .unwrap_or("default");
+                                let resp = start_capture(&pipeline_tx, device).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
+                            }
+
+                            if val.get("stop_capture").is_some() {
+                                let resp = stop_capture(&pipeline_tx).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
+                            }
+
+                            // ── Node commands ──────────────────────────────
+                            if let Some(obj) = val.get("send_command").and_then(|v| v.as_object()) {
+                                let resp = send_command(&pipeline_tx, obj).await;
+                                let _ = ws_tx.send(Message::Text(resp.into())).await;
+                            }
                         }
                     }
                     Some(Ok(Message::Close(_))) | None => break,
@@ -186,7 +217,7 @@ async fn handle_connection(
                                 }
                             }
                             TapMessage::Metadata { stream, fields, timestamp } => {
-                                if subscribe_all || subscriptions.contains(*stream) || subscriptions.contains("metadata") {
+                                if subscribe_all || subscriptions.contains(stream.as_str()) || subscriptions.contains("metadata") {
                                     vad_msg_count += 1;
                                     let json = serde_json::json!({
                                         "type": "metadata",
@@ -313,6 +344,92 @@ async fn set_mode(tx: &mpsc::Sender<PipelineRequest>, mode: &str) -> String {
         Ok(Ok(())) => serde_json::json!({"type": "set_mode_result", "ok": true}).to_string(),
         Ok(Err(e)) => serde_json::json!({"type": "set_mode_result", "error": e.to_string()}).to_string(),
         Err(_) => serde_json::json!({"type": "set_mode_result", "error": "orchestrator unavailable"}).to_string(),
+    }
+}
+
+// ── Node type registry ──────────────────────────────────────────────
+
+async fn get_node_types(tx: &mpsc::Sender<PipelineRequest>) -> String {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::GetNodeTypes { reply }).await;
+
+    match rx.await {
+        Ok(types) => serde_json::json!({
+            "type": "node_types",
+            "node_types": types,
+        }).to_string(),
+        Err(_) => serde_json::json!({
+            "type": "node_types",
+            "node_types": [],
+        }).to_string(),
+    }
+}
+
+// ── Pipeline lifecycle helpers (standalone mode) ────────────────────
+
+async fn load_pipeline(tx: &mpsc::Sender<PipelineRequest>, def: &serde_json::Value) -> String {
+    let json = def.to_string();
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::LoadPipeline { json, reply }).await;
+
+    match rx.await {
+        Ok(Ok(())) => serde_json::json!({"type": "load_pipeline_result", "ok": true}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"type": "load_pipeline_result", "error": e.to_string()}).to_string(),
+        Err(_) => serde_json::json!({"type": "load_pipeline_result", "error": "orchestrator unavailable"}).to_string(),
+    }
+}
+
+async fn start_capture(tx: &mpsc::Sender<PipelineRequest>, device: &str) -> String {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::StartCapture {
+        device: device.to_string(),
+        reply,
+    }).await;
+
+    match rx.await {
+        Ok(Ok(())) => serde_json::json!({"type": "start_capture_result", "ok": true}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"type": "start_capture_result", "error": e.to_string()}).to_string(),
+        Err(_) => serde_json::json!({"type": "start_capture_result", "error": "orchestrator unavailable"}).to_string(),
+    }
+}
+
+async fn stop_capture(tx: &mpsc::Sender<PipelineRequest>) -> String {
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::StopCapture { reply }).await;
+
+    match rx.await {
+        Ok(Ok(())) => serde_json::json!({"type": "stop_capture_result", "ok": true}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"type": "stop_capture_result", "error": e.to_string()}).to_string(),
+        Err(_) => serde_json::json!({"type": "stop_capture_result", "error": "orchestrator unavailable"}).to_string(),
+    }
+}
+
+// ── Node command dispatch ────────────────────────────────────────────
+
+async fn send_command(
+    tx: &mpsc::Sender<PipelineRequest>,
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let node = obj.get("node").and_then(|v| v.as_str()).unwrap_or("");
+    let cmd = obj.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+    let args = obj.get("args").cloned().unwrap_or(serde_json::json!({}));
+
+    if node.is_empty() || cmd.is_empty() {
+        return serde_json::json!({"type": "send_command_result", "error": "missing node or cmd"}).to_string();
+    }
+
+    let (reply, rx) = tokio::sync::oneshot::channel();
+    let _ = tx.send(PipelineRequest::SendCommand {
+        node: node.to_string(),
+        cmd: cmd.to_string(),
+        args,
+        reply,
+    }).await;
+
+    match rx.await {
+        Ok(Ok(result)) => serde_json::json!({"type": "send_command_result", "ok": true, "result": result}).to_string(),
+        Ok(Err(e)) => serde_json::json!({"type": "send_command_result", "error": e.to_string()}).to_string(),
+        Err(_) => serde_json::json!({"type": "send_command_result", "error": "orchestrator unavailable"}).to_string(),
     }
 }
 

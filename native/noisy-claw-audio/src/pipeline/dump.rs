@@ -20,7 +20,7 @@ pub enum TapMessage {
         timestamp: f64,
     },
     Metadata {
-        stream: &'static str,
+        stream: String,
         fields: serde_json::Value,
         timestamp: f64,
     },
@@ -38,7 +38,7 @@ enum DumpMsg {
         sample_rate: u32,
     },
     Metadata {
-        stream: &'static str,
+        stream: String,
         data: String,
     },
     Finish,
@@ -138,17 +138,17 @@ pub fn write(tap: &'static str, samples: &[f32], sample_rate: u32) {
 }
 
 /// Write structured metadata to a named stream. Non-blocking; no-op when dump is disabled.
-pub fn write_metadata(stream: &'static str, fields: serde_json::Value) {
+pub fn write_metadata(stream: &str, fields: serde_json::Value) {
     if let Some(inner) = DUMP.get() {
         let timestamp = elapsed_secs();
 
         let _ = inner.tx.send(DumpMsg::Metadata {
-            stream,
+            stream: stream.to_string(),
             data: fields.to_string(),
         });
 
         let _ = inner.tap_tx.send(TapMessage::Metadata {
-            stream,
+            stream: stream.to_string(),
             fields,
             timestamp,
         });
@@ -224,7 +224,7 @@ fn writer_thread(rx: mpsc::Receiver<DumpMsg>, dir: PathBuf) {
     let mut writers: HashMap<&'static str, BufWriter<File>> = HashMap::new();
     let mut sample_rates: HashMap<&'static str, u32> = HashMap::new();
 
-    let mut metadata_writers: HashMap<&'static str, BufWriter<File>> = HashMap::new();
+    let mut metadata_writers: HashMap<String, BufWriter<File>> = HashMap::new();
 
     for msg in rx {
         match msg {
@@ -248,7 +248,7 @@ fn writer_thread(rx: mpsc::Receiver<DumpMsg>, dir: PathBuf) {
                 }
             }
             DumpMsg::Metadata { stream, data } => {
-                let writer = metadata_writers.entry(stream).or_insert_with(|| {
+                let writer = metadata_writers.entry(stream.clone()).or_insert_with(|| {
                     let path = dir.join(format!("{stream}.jsonl"));
                     let file = File::create(&path)
                         .expect("audio dump: failed to create metadata file");

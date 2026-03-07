@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use anyhow::{anyhow, Result};
 use tokio::sync::mpsc;
 
+use crate::pipeline::graph::definition::DataStreamDescriptor;
 use crate::pipeline::graph::node::{NodeHandle, PipelineNode};
 use crate::pipeline::graph::registry::NodeFactoryEntry;
 use crate::pipeline::graph::types::{
@@ -57,6 +58,14 @@ impl NodeWiring for CaptureNode {
 impl PipelineNode for CaptureNode {
     fn node_type(&self) -> &'static str { "capture" }
 
+    fn data_streams(&self) -> Vec<DataStreamDescriptor> {
+        vec![DataStreamDescriptor::Audio {
+            name: "capture".into(),
+            sample_rate: 48000,
+            node: None,
+        }]
+    }
+
     fn ports(&self) -> Vec<PortDescriptor> {
         capture_ports()
     }
@@ -75,6 +84,28 @@ impl PipelineNode for CaptureNode {
         Ok(())
     }
 
+    async fn command(&mut self, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        match cmd {
+            "start" => {
+                let device = args.get("device").and_then(|v| v.as_str()).unwrap_or("default");
+                let sample_rate = args.get("sample_rate").and_then(|v| v.as_u64()).unwrap_or(48000) as u32;
+                if let Some(h) = self.inner() {
+                    h.start(device, sample_rate).await;
+                }
+                Ok(serde_json::json!({}))
+            }
+            "stop" => {
+                if let Some(h) = self.inner() { h.stop().await; }
+                Ok(serde_json::json!({}))
+            }
+            "status" => {
+                let capturing = self.inner().map_or(false, |h| h.is_capturing());
+                Ok(serde_json::json!({ "capturing": capturing }))
+            }
+            _ => Err(anyhow!("capture: unknown command: {cmd}")),
+        }
+    }
+
     fn snapshot(&self) -> NodeSnapshot {
         let mut p = serde_json::Map::new();
         p.insert("device".into(), serde_json::json!(self.device));
@@ -84,6 +115,7 @@ impl PipelineNode for CaptureNode {
             status: self.status.clone(),
             properties: p,
             metrics: HashMap::new(),
+            last_error: None,
         }
     }
 

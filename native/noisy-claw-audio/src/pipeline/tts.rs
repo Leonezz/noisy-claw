@@ -1,4 +1,4 @@
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 
 use crate::cloud;
@@ -70,12 +70,16 @@ impl Handle {
 
 /// Spawn the TTS node.
 ///
+/// Inputs:
+///   - `user_speaking_rx`: watch state from VadNode (for barge-in detection)
+///
 /// Outputs:
 ///   - `output_tx`: OutputMessages to the OutputNode
-///   - `event_tx`:  IPC events (errors)
+///   - `event_tx`:  IPC events (SpeakStarted, errors)
 pub fn spawn(
     output_tx: mpsc::Sender<OutputMessage>,
     event_tx: mpsc::Sender<Event>,
+    mut user_speaking_rx: Option<watch::Receiver<bool>>,
 ) -> Handle {
     let (ctl_tx, mut ctl_rx) = mpsc::channel(16);
 
@@ -89,6 +93,29 @@ pub fn spawn(
 
         loop {
             tokio::select! {
+                // Barge-in: user started speaking while TTS is active
+                _ = async {
+                    match user_speaking_rx.as_mut() {
+                        Some(rx) => rx.changed().await.ok(),
+                        None => std::future::pending::<Option<()>>().await,
+                    }
+                } => {
+                    let speaking = user_speaking_rx.as_ref()
+                        .map(|rx| *rx.borrow())
+                        .unwrap_or(false);
+                    if speaking && active_request_id.is_some() {
+                        let req_id = active_request_id.take();
+                        tracing::info!(?req_id, "TTS node: barge-in detected, cancelling synthesis");
+                        cancel_active(
+                            &mut synthesis_handle,
+                            &mut tts_session,
+                            &mut forwarding_handle,
+                        ).await;
+                        // Tell output to stop playing (propagates through data edge)
+                        let _ = output_tx.send(OutputMessage::StopAll).await;
+                    }
+                }
+
                 Some(ctl) = ctl_rx.recv() => {
                     match ctl {
                         Control::Speak { text, tts_config, request_id } => {
@@ -100,6 +127,9 @@ pub fn spawn(
                             ).await;
 
                             active_request_id = Some(request_id.clone());
+                            let _ = event_tx.send(Event::SpeakStarted {
+                                request_id: Some(request_id.0.clone()),
+                            }).await;
                             let sample_rate = tts_config.sample_rate.unwrap_or(16000);
                             let out_tx = output_tx.clone();
                             let ev_tx = event_tx.clone();
@@ -188,6 +218,9 @@ pub fn spawn(
                             ).await;
 
                             active_request_id = Some(request_id.clone());
+                            let _ = event_tx.send(Event::SpeakStarted {
+                                request_id: Some(request_id.0.clone()),
+                            }).await;
                             let sample_rate = tts_config.sample_rate.unwrap_or(16000);
                             let api_key = match &tts_config.api_key {
                                 Some(k) => k.clone(),

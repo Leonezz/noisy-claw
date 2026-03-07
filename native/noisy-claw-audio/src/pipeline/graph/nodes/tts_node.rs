@@ -2,7 +2,7 @@ use std::borrow::Cow;
 use std::collections::HashMap;
 
 use anyhow::{anyhow, Result};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::pipeline::graph::node::{NodeHandle, PipelineNode};
 use crate::pipeline::graph::registry::NodeFactoryEntry;
@@ -11,12 +11,13 @@ use crate::pipeline::graph::types::{
     PropertyDescriptor, PropertyMap,
 };
 use crate::pipeline::graph::wiring::{InputEndpoint, NodeWiring, OutputEndpoint};
-use crate::pipeline::{tts, FlushAck, FlushSignal, NodeId, OutputMessage};
-use crate::protocol::Event;
+use crate::pipeline::{tts, FlushAck, FlushSignal, NodeId, OutputMessage, RequestId};
+use crate::protocol::{Event, TtsConfig};
 
 pub struct TtsNode {
     output_msg_out: Option<OutputEndpoint>,
     ipc_event_out: Option<OutputEndpoint>,
+    user_speaking_in: Option<watch::Receiver<bool>>,
     inner: Option<tts::Handle>,
     status: NodeStatus,
 }
@@ -26,6 +27,7 @@ impl TtsNode {
         Ok(Self {
             output_msg_out: None,
             ipc_event_out: None,
+            user_speaking_in: None,
             inner: None,
             status: NodeStatus::Created,
         })
@@ -35,8 +37,14 @@ impl TtsNode {
 }
 
 impl NodeWiring for TtsNode {
-    fn accept_input(&mut self, port: &str, _ep: InputEndpoint) -> Result<()> {
-        Err(anyhow!("tts: no input port '{port}'"))
+    fn accept_input(&mut self, port: &str, ep: InputEndpoint) -> Result<()> {
+        match port {
+            "user_speaking_in" => match ep {
+                InputEndpoint::State(rx) => { self.user_speaking_in = Some(rx); Ok(()) }
+                _ => Err(anyhow!("user_speaking_in expects State")),
+            },
+            _ => Err(anyhow!("tts: unknown input '{port}'")),
+        }
     }
 
     fn set_output(&mut self, port: &str, ep: OutputEndpoint) -> Result<()> {
@@ -56,12 +64,54 @@ impl PipelineNode for TtsNode {
     fn property_descriptors(&self) -> Vec<PropertyDescriptor> { vec![] }
     fn update(&mut self, _props: &PropertyMap) -> Result<()> { Ok(()) }
 
+    async fn command(&mut self, cmd: &str, args: serde_json::Value) -> Result<serde_json::Value> {
+        let h = self.inner.as_ref().ok_or_else(|| anyhow!("tts: not started"))?;
+        match cmd {
+            "speak" => {
+                let text = args.get("text").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("text required"))?.to_string();
+                let tts_config: TtsConfig = serde_json::from_value(
+                    args.get("tts").cloned().ok_or_else(|| anyhow!("tts config required"))?
+                )?;
+                let request_id = args.get("request_id").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("request_id required"))?.to_string();
+                h.speak(text, tts_config, RequestId(request_id)).await;
+                Ok(serde_json::json!({}))
+            }
+            "speak_start" => {
+                let tts_config: TtsConfig = serde_json::from_value(
+                    args.get("tts").cloned().ok_or_else(|| anyhow!("tts config required"))?
+                )?;
+                let request_id = args.get("request_id").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("request_id required"))?.to_string();
+                h.speak_start(tts_config, RequestId(request_id)).await;
+                Ok(serde_json::json!({}))
+            }
+            "speak_chunk" => {
+                let text = args.get("text").and_then(|v| v.as_str())
+                    .ok_or_else(|| anyhow!("text required"))?.to_string();
+                h.speak_chunk(text).await;
+                Ok(serde_json::json!({}))
+            }
+            "speak_end" => {
+                h.speak_end().await;
+                Ok(serde_json::json!({}))
+            }
+            "stop" => {
+                h.stop().await;
+                Ok(serde_json::json!({}))
+            }
+            _ => Err(anyhow!("tts: unknown command: {cmd}")),
+        }
+    }
+
     fn snapshot(&self) -> NodeSnapshot {
         NodeSnapshot {
             node_type: "tts".to_string(),
             status: self.status.clone(),
             properties: serde_json::Map::new(),
             metrics: HashMap::new(),
+            last_error: None,
         }
     }
 
@@ -86,7 +136,8 @@ impl PipelineNode for TtsNode {
             while let Some(ev) = evt_rx.recv().await { ipc_out.send(ev); }
         });
 
-        let handle = tts::spawn(msg_tx, evt_tx);
+        let user_speaking_rx = self.user_speaking_in.take();
+        let handle = tts::spawn(msg_tx, evt_tx, user_speaking_rx);
         self.inner = Some(handle);
         self.status = NodeStatus::Running;
         let (stx, _) = mpsc::channel(1);
@@ -111,6 +162,7 @@ impl PipelineNode for TtsNode {
 
 fn tts_ports() -> Vec<PortDescriptor> {
     vec![
+        PortDescriptor { name: Cow::Borrowed("user_speaking_in"), port_type: PortType::State, direction: Direction::In },
         PortDescriptor { name: Cow::Borrowed("output_msg_out"), port_type: PortType::OutputMsg, direction: Direction::Out },
         PortDescriptor { name: Cow::Borrowed("ipc_event_out"), port_type: PortType::IpcEvent, direction: Direction::Out },
     ]

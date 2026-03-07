@@ -4,6 +4,14 @@ version = "0.1.0"
 edition = "2021"
 description = "Audio engine for noisy-claw: capture, VAD, STT, playback"
 
+[[bin]]
+name = "noisy-claw-audio"
+path = "src/main.rs"
+
+[[bin]]
+name = "noisy-claw-standalone"
+path = "src/bin/standalone.rs"
+
 [dependencies]
 # Audio capture & playback
 cpal = "0.17"
